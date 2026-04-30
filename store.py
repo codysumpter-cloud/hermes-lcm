@@ -38,6 +38,7 @@ from .search_query import (
     AGE_DECAY_RATE,
     should_apply_directness_rank_adjustment,
 )
+from .message_content import normalize_content_value as _normalize_content_value
 from .tokens import count_message_tokens
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,14 @@ _MESSAGE_SELECT_COLUMNS = (
 _UNKNOWN_SOURCE = "unknown"
 
 
+def _legacy_blank_source_clause(column: str) -> str:
+    # SQLite TRIM() only strips spaces unless given an explicit character set.
+    # Match Python's write-time `str.strip()` behavior for common ASCII whitespace
+    # so legacy tabs/newlines do not become a fake attributed source bucket.
+    whitespace_chars = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
+    return f"({column} IS NULL OR TRIM({column}, {whitespace_chars}) = '')"
+
+
 def _normalize_source_value(source: str | None) -> str:
     normalized = (source or "").strip()
     return normalized or _UNKNOWN_SOURCE
@@ -61,7 +70,7 @@ def _source_filter_clause(column: str, source: str | None) -> tuple[str | None, 
     if not normalized:
         return None, []
     if normalized == _UNKNOWN_SOURCE:
-        return f"({column} = ? OR {column} = '')", [_UNKNOWN_SOURCE]
+        return f"({column} = ? OR {_legacy_blank_source_clause(column)})", [_UNKNOWN_SOURCE]
     return f"{column} = ?", [normalized]
 
 
@@ -155,6 +164,40 @@ def _fts_primary_value(result: Dict[str, Any], sort: str | None) -> float:
     return rank_value
 
 
+def build_message_fts_spec() -> ExternalContentFtsSpec:
+    return ExternalContentFtsSpec(
+        table_name="messages_fts",
+        content_table="messages",
+        content_rowid="store_id",
+        indexed_column="content",
+        trigger_sqls=(
+            """
+            CREATE TRIGGER IF NOT EXISTS msg_fts_insert
+                AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, content)
+                    VALUES (new.store_id, new.content);
+            END;
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS msg_fts_delete
+                AFTER DELETE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, content)
+                    VALUES('delete', old.store_id, old.content);
+            END;
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS msg_fts_update
+                AFTER UPDATE OF content ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, content)
+                    VALUES('delete', old.store_id, old.content);
+                INSERT INTO messages_fts(rowid, content)
+                    VALUES (new.store_id, new.content);
+            END;
+            """,
+        ),
+    )
+
+
 class MessageStore:
     """SQLite-backed immutable message store."""
 
@@ -193,37 +236,7 @@ class MessageStore:
         """)
         ensure_external_content_fts(
             self._conn,
-            ExternalContentFtsSpec(
-                table_name="messages_fts",
-                content_table="messages",
-                content_rowid="store_id",
-                indexed_column="content",
-                trigger_sqls=(
-                    """
-                    CREATE TRIGGER IF NOT EXISTS msg_fts_insert
-                        AFTER INSERT ON messages BEGIN
-                        INSERT INTO messages_fts(rowid, content)
-                            VALUES (new.store_id, new.content);
-                    END;
-                    """,
-                    """
-                    CREATE TRIGGER IF NOT EXISTS msg_fts_delete
-                        AFTER DELETE ON messages BEGIN
-                        INSERT INTO messages_fts(messages_fts, rowid, content)
-                            VALUES('delete', old.store_id, old.content);
-                    END;
-                    """,
-                    """
-                    CREATE TRIGGER IF NOT EXISTS msg_fts_update
-                        AFTER UPDATE OF content ON messages BEGIN
-                        INSERT INTO messages_fts(messages_fts, rowid, content)
-                            VALUES('delete', old.store_id, old.content);
-                        INSERT INTO messages_fts(rowid, content)
-                            VALUES (new.store_id, new.content);
-                    END;
-                    """,
-                ),
-            ),
+            build_message_fts_spec(),
         )
         run_versioned_migrations(self._conn)
         self._ensure_source_column()
@@ -256,7 +269,7 @@ class MessageStore:
                 session_id,
                 _normalize_source_value(source),
                 msg.get("role", "unknown"),
-                msg.get("content"),
+                _normalize_content_value(msg.get("content")),
                 msg.get("tool_call_id"),
                 tc_json,
                 msg.get("tool_name"),
@@ -291,7 +304,7 @@ class MessageStore:
                         session_id,
                         _normalize_source_value(source),
                         msg.get("role", "unknown"),
-                        msg.get("content"),
+                        _normalize_content_value(msg.get("content")),
                         msg.get("tool_call_id"),
                         tc_json,
                         msg.get("tool_name"),
@@ -302,6 +315,17 @@ class MessageStore:
                 )
                 ids.append(cur.lastrowid)
         return ids
+
+    def reassign_session_messages(self, old_session_id: str, new_session_id: str) -> int:
+        """Move all persisted messages from one session_id to another."""
+        if not old_session_id or not new_session_id or old_session_id == new_session_id:
+            return 0
+        cur = self._conn.execute(
+            "UPDATE messages SET session_id = ? WHERE session_id = ?",
+            (new_session_id, old_session_id),
+        )
+        self._conn.commit()
+        return cur.rowcount if cur.rowcount is not None else 0
 
     def delete_session_messages(self, session_id: str) -> int:
         """Delete all messages for a session. Returns count deleted."""
@@ -430,18 +454,17 @@ class MessageStore:
             where = "WHERE session_id = ?"
             args.append(session_id)
 
+        legacy_blank_clause = _legacy_blank_source_clause("source")
         query = f"""
             SELECT COUNT(*) AS messages_total,
-                   COALESCE(SUM(CASE WHEN source = '{_UNKNOWN_SOURCE}' THEN 1 ELSE 0 END), 0) AS normalized_unknown_messages,
-                   COALESCE(SUM(CASE WHEN source = '' THEN 1 ELSE 0 END), 0) AS legacy_blank_source_messages,
-                   COALESCE(SUM(CASE WHEN source != '' AND source != '{_UNKNOWN_SOURCE}' THEN 1 ELSE 0 END), 0) AS attributed_messages
+                   COALESCE(SUM(CASE WHEN source = ? THEN 1 ELSE 0 END), 0) AS normalized_unknown_messages,
+                   COALESCE(SUM(CASE WHEN {legacy_blank_clause} THEN 1 ELSE 0 END), 0) AS legacy_blank_source_messages,
+                   COALESCE(SUM(CASE WHEN NOT {legacy_blank_clause} AND source != ? THEN 1 ELSE 0 END), 0) AS attributed_messages
             FROM messages
             {where}
             """
-        if args:
-            row = self._conn.execute(query, args).fetchone()
-        else:
-            row = self._conn.execute(query).fetchone()
+        query_args: list[Any] = [_UNKNOWN_SOURCE, _UNKNOWN_SOURCE, *args]
+        row = self._conn.execute(query, query_args).fetchone()
 
         messages_total = int(row[0] or 0) if row else 0
         normalized_unknown = int(row[1] or 0) if row else 0
@@ -453,6 +476,45 @@ class MessageStore:
             "normalized_unknown_messages": normalized_unknown,
             "legacy_blank_source_messages": legacy_blank,
             "effective_unknown_messages": normalized_unknown + legacy_blank,
+        }
+
+    def get_source_normalization_plan(self) -> Dict[str, Any]:
+        """Return a dry-run plan for normalizing legacy blank source values."""
+        stats_before = self.get_source_stats()
+        blank_clause = _legacy_blank_source_clause("source")
+        row = self._conn.execute(
+            f"""
+            SELECT COUNT(*) AS would_update_messages,
+                   COUNT(DISTINCT session_id) AS affected_sessions
+            FROM messages
+            WHERE {blank_clause}
+            """
+        ).fetchone()
+        would_update = int(row[0] or 0) if row else 0
+        affected_sessions = int(row[1] or 0) if row else 0
+        return {
+            "target_source": _UNKNOWN_SOURCE,
+            "would_update_messages": would_update,
+            "affected_sessions": affected_sessions,
+            "stats_before": stats_before,
+        }
+
+    def normalize_legacy_blank_sources(self) -> Dict[str, Any]:
+        """Normalize legacy NULL/blank source rows to the explicit unknown bucket."""
+        stats_before = self.get_source_stats()
+        blank_clause = _legacy_blank_source_clause("source")
+        with self._conn:
+            cur = self._conn.execute(
+                f"UPDATE messages SET source = ? WHERE {blank_clause}",
+                (_UNKNOWN_SOURCE,),
+            )
+        updated = cur.rowcount if cur.rowcount is not None else 0
+        stats_after = self.get_source_stats()
+        return {
+            "target_source": _UNKNOWN_SOURCE,
+            "updated_messages": int(updated),
+            "stats_before": stats_before,
+            "stats_after": stats_after,
         }
 
     def get_time_bounds(self, store_ids: List[int]) -> tuple[float | None, float | None]:

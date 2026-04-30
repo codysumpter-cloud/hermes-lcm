@@ -2,9 +2,11 @@
 
 import json
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -22,6 +24,181 @@ from hermes_lcm.session_patterns import (
     compile_session_patterns,
     matches_session_pattern,
 )
+
+
+class TestModelRouting:
+    def test_provider_prefixed_model_stays_model_only_when_provider_unresolved(self):
+        from hermes_lcm.model_routing import parse_lcm_model_override
+
+        route = parse_lcm_model_override(
+            "cerebras/gpt-oss-120b",
+            provider_resolver=lambda _provider: False,
+        )
+
+        assert route.provider is None
+        assert route.model == "cerebras/gpt-oss-120b"
+
+    def test_provider_prefixed_direct_model_is_split_when_provider_resolves(self):
+        from hermes_lcm.model_routing import parse_lcm_model_override
+
+        route = parse_lcm_model_override(
+            "cerebras/gpt-oss-120b",
+            provider_resolver=lambda provider: provider == "cerebras",
+        )
+
+        assert route.provider == "cerebras"
+        assert route.model == "gpt-oss-120b"
+
+    def test_openrouter_organization_slug_stays_model_only(self):
+        from hermes_lcm.model_routing import parse_lcm_model_override
+
+        route = parse_lcm_model_override("meta-llama/Llama-3.3-70B-Instruct")
+
+        assert route.provider is None
+        assert route.model == "meta-llama/Llama-3.3-70B-Instruct"
+
+    def test_google_namespace_slug_stays_model_only(self):
+        from hermes_lcm.model_routing import parse_lcm_model_override
+
+        route = parse_lcm_model_override("google/gemini-3-flash-preview")
+
+        assert route.provider is None
+        assert route.model == "google/gemini-3-flash-preview"
+
+    def test_anthropic_namespace_slug_stays_model_only(self):
+        from hermes_lcm.model_routing import parse_lcm_model_override
+
+        route = parse_lcm_model_override("anthropic/claude-sonnet-4.5")
+
+        assert route.provider is None
+        assert route.model == "anthropic/claude-sonnet-4.5"
+
+
+class TestProviderPrefixedAuxiliaryCalls:
+    def _fake_response(self, content="ok"):
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+        )
+
+    def _install_fake_auxiliary_client(self, monkeypatch, fake_call_llm):
+        auxiliary_client = ModuleType("agent.auxiliary_client")
+        auxiliary_client.call_llm = fake_call_llm
+        monkeypatch.setitem(sys.modules, "agent.auxiliary_client", auxiliary_client)
+
+    def _install_fake_cerebras_provider(self, monkeypatch):
+        hermes_cli = ModuleType("hermes_cli")
+        hermes_cli.__path__ = []
+
+        runtime_provider = ModuleType("hermes_cli.runtime_provider")
+
+        def fake_get_named_custom_provider(provider):
+            if provider == "cerebras":
+                return {"name": "cerebras", "base_url": "https://api.cerebras.ai/v1"}
+            return None
+
+        runtime_provider._get_named_custom_provider = fake_get_named_custom_provider
+
+        auth = ModuleType("hermes_cli.auth")
+        auth.PROVIDER_REGISTRY = {}
+
+        hermes_cli.runtime_provider = runtime_provider
+        hermes_cli.auth = auth
+        monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
+        monkeypatch.setitem(sys.modules, "hermes_cli.runtime_provider", runtime_provider)
+        monkeypatch.setitem(sys.modules, "hermes_cli.auth", auth)
+
+    def test_summary_call_passes_provider_and_stripped_model(self, monkeypatch):
+        from hermes_lcm.escalation import _call_llm_for_summary
+
+        seen = {}
+
+        def fake_call_llm(**kwargs):
+            seen.update(kwargs)
+            return self._fake_response("summary")
+
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
+        self._install_fake_cerebras_provider(monkeypatch)
+
+        result = _call_llm_for_summary("summarize", 200, model="cerebras/gpt-oss-120b")
+
+        assert result == "summary"
+        assert seen["provider"] == "cerebras"
+        assert seen["model"] == "gpt-oss-120b"
+
+    def test_summary_call_keeps_unresolved_direct_slug_model_only(self, monkeypatch):
+        from hermes_lcm.escalation import _call_llm_for_summary
+
+        seen = {}
+
+        def fake_call_llm(**kwargs):
+            seen.update(kwargs)
+            return self._fake_response("summary")
+
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
+
+        result = _call_llm_for_summary("summarize", 200, model="cerebras/gpt-oss-120b")
+
+        assert result == "summary"
+        assert "provider" not in seen
+        assert seen["model"] == "cerebras/gpt-oss-120b"
+
+    def test_summary_call_keeps_openrouter_slug_as_model_only(self, monkeypatch):
+        from hermes_lcm.escalation import _call_llm_for_summary
+
+        seen = {}
+
+        def fake_call_llm(**kwargs):
+            seen.update(kwargs)
+            return self._fake_response("summary")
+
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
+
+        _call_llm_for_summary("summarize", 200, model="meta-llama/Llama-3.3-70B-Instruct")
+
+        assert "provider" not in seen
+        assert seen["model"] == "meta-llama/Llama-3.3-70B-Instruct"
+
+    def test_extraction_call_passes_provider_and_stripped_model(self, monkeypatch):
+        from hermes_lcm.extraction import _call_extraction_llm
+
+        seen = {}
+
+        def fake_call_llm(**kwargs):
+            seen.update(kwargs)
+            return self._fake_response("- decision")
+
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
+        self._install_fake_cerebras_provider(monkeypatch)
+
+        result = _call_extraction_llm("extract", model="cerebras/gpt-oss-120b")
+
+        assert result == "- decision"
+        assert seen["provider"] == "cerebras"
+        assert seen["model"] == "gpt-oss-120b"
+
+    def test_expansion_call_passes_provider_and_stripped_model(self, monkeypatch):
+        from hermes_lcm.tools import _synthesize_expansion_answer
+
+        seen = {}
+
+        def fake_call_llm(**kwargs):
+            seen.update(kwargs)
+            return self._fake_response("answer")
+
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
+        self._install_fake_cerebras_provider(monkeypatch)
+
+        result = _synthesize_expansion_answer(
+            prompt="question",
+            context_blocks=[{"content": "context"}],
+            model="cerebras/gpt-oss-120b",
+            max_tokens=300,
+            timeout=12,
+        )
+
+        assert result == "answer"
+        assert seen["provider"] == "cerebras"
+        assert seen["model"] == "gpt-oss-120b"
 
 
 class TestConfig:
@@ -156,6 +333,20 @@ class TestTokens:
         msg = {"role": "user", "content": "hello world this is a test"}
         assert count_message_tokens(msg) > 0
 
+    def test_count_message_tokens_normalizes_content_parts(self):
+        content = [
+            {"type": "text", "text": "hello from content parts " * 50},
+            {"type": "image_url", "image_url": {"url": "file:///tmp/example.png"}},
+        ]
+        msg = {"role": "user", "content": content}
+        normalized_msg = {
+            "role": "user",
+            "content": json.dumps(content, ensure_ascii=False, sort_keys=True),
+        }
+
+        assert count_message_tokens(msg) == count_message_tokens(normalized_msg)
+        assert count_message_tokens(msg) > 100
+
     def test_count_messages_tokens(self):
         msgs = [
             {"role": "user", "content": "hello"},
@@ -185,6 +376,36 @@ class TestMessageStore:
         ids = store.append_batch("sess1", msgs, [1, 2, 3])
         assert len(ids) == 3
         assert ids[0] < ids[1] < ids[2]
+
+    def test_append_batch_accepts_content_parts(self, store):
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hello from content parts"},
+                    {"type": "image_url", "image_url": {"url": "file:///tmp/example.png"}},
+                ],
+            }
+        ]
+
+        ids = store.append_batch("sess1", msgs, [7], source="telegram")
+
+        retrieved = store.get(ids[0])
+        assert isinstance(retrieved["content"], str)
+        assert "hello from content parts" in retrieved["content"]
+        results = store.search("hello", session_id="sess1")
+        assert [result["store_id"] for result in results] == ids
+
+    def test_append_accepts_content_parts(self, store):
+        sid = store.append(
+            "sess1",
+            {"role": "assistant", "content": [{"type": "text", "text": "assistant part text"}]},
+            token_estimate=3,
+        )
+
+        retrieved = store.get(sid)
+        assert isinstance(retrieved["content"], str)
+        assert "assistant part text" in retrieved["content"]
 
     def test_get_range(self, store):
         msgs = [{"role": "user", "content": f"msg {i}"} for i in range(10)]
@@ -271,6 +492,87 @@ class TestMessageStore:
         assert stats["normalized_unknown_messages"] == 1
         assert stats["legacy_blank_source_messages"] == 1
         assert stats["effective_unknown_messages"] == 2
+
+        store.close()
+
+    def test_source_unknown_filter_matches_null_and_whitespace_legacy_source_rows(self, tmp_path):
+        db_path = tmp_path / "legacy-null-whitespace-source.db"
+        store = MessageStore(db_path)
+        for source in (None, "", "   ", "\t\n"):
+            store._conn.execute(
+                """INSERT INTO messages
+                   (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ("legacy-session", source, "user", f"docker with {source!r} source", None, None, None, 1.0, 5, 0),
+            )
+        store._conn.commit()
+
+        results = store.search("docker", source="unknown")
+        fetched = [store.get(result["store_id"]) for result in results]
+
+        assert len(results) == 4
+        assert {result["source"] for result in results} == {"unknown"}
+        assert {item["source"] for item in fetched} == {"unknown"}
+
+        store.close()
+
+    def test_get_source_stats_treats_null_and_whitespace_as_legacy_blank(self, tmp_path):
+        db_path = tmp_path / "source-stats-legacy-shapes.db"
+        store = MessageStore(db_path)
+        store.append("sess-known", {"role": "user", "content": "cli message"}, source="cli")
+        store.append("sess-unknown", {"role": "user", "content": "unknown message"})
+        for source in (None, "", "   ", "\t\n"):
+            store._conn.execute(
+                """INSERT INTO messages
+                   (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ("legacy-session", source, "user", "legacy source shape", None, None, None, 1.0, 5, 0),
+            )
+        store._conn.commit()
+
+        stats = store.get_source_stats()
+
+        assert stats["messages_total"] == 6
+        assert stats["attributed_messages"] == 1
+        assert stats["normalized_unknown_messages"] == 1
+        assert stats["legacy_blank_source_messages"] == 4
+        assert stats["effective_unknown_messages"] == 5
+
+        store.close()
+
+    def test_source_normalization_plan_and_apply_are_idempotent(self, tmp_path):
+        db_path = tmp_path / "source-normalization.db"
+        store = MessageStore(db_path)
+        store.append("sess-known", {"role": "user", "content": "cli message"}, source="cli")
+        store.append("sess-unknown", {"role": "user", "content": "unknown message"})
+        for session_id, source in (("legacy-a", None), ("legacy-a", ""), ("legacy-b", "   "), ("legacy-b", "\t\n")):
+            store._conn.execute(
+                """INSERT INTO messages
+                   (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, source, "user", "legacy source shape", None, None, None, 1.0, 5, 0),
+            )
+        store._conn.commit()
+
+        plan = store.get_source_normalization_plan()
+
+        assert plan["target_source"] == "unknown"
+        assert plan["would_update_messages"] == 4
+        assert plan["affected_sessions"] == 2
+        assert plan["stats_before"]["legacy_blank_source_messages"] == 4
+
+        first = store.normalize_legacy_blank_sources()
+        second = store.normalize_legacy_blank_sources()
+        stats = store.get_source_stats()
+
+        assert first["updated_messages"] == 4
+        assert first["stats_before"]["legacy_blank_source_messages"] == 4
+        assert first["stats_after"]["legacy_blank_source_messages"] == 0
+        assert second["updated_messages"] == 0
+        assert stats["messages_total"] == 6
+        assert stats["attributed_messages"] == 1
+        assert stats["normalized_unknown_messages"] == 5
+        assert stats["effective_unknown_messages"] == 5
 
         store.close()
 
@@ -1212,6 +1514,178 @@ class TestLifecycleStateStore:
 
         state.close()
 
+    def test_init_upgrades_existing_lifecycle_table_with_rotation_columns(self, tmp_path):
+        db_path = tmp_path / "legacy-lifecycle-rotation.db"
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+            INSERT INTO metadata(key, value) VALUES ('schema_version', '4');
+
+            CREATE TABLE lcm_migration_state (
+                step_name TEXT PRIMARY KEY,
+                completed_at REAL NOT NULL
+            );
+
+            CREATE TABLE lcm_lifecycle_state (
+                conversation_id TEXT PRIMARY KEY,
+                current_session_id TEXT,
+                last_finalized_session_id TEXT,
+                current_frontier_store_id INTEGER NOT NULL DEFAULT 0,
+                last_finalized_frontier_store_id INTEGER NOT NULL DEFAULT 0,
+                debt_kind TEXT,
+                debt_size_estimate INTEGER NOT NULL DEFAULT 0,
+                current_bound_at REAL,
+                last_finalized_at REAL,
+                debt_updated_at REAL,
+                last_maintenance_attempt_at REAL,
+                updated_at REAL NOT NULL DEFAULT (strftime('%s','now'))
+            );
+
+            INSERT INTO lcm_lifecycle_state(
+                conversation_id,
+                current_session_id,
+                last_finalized_session_id,
+                current_frontier_store_id,
+                last_finalized_frontier_store_id,
+                debt_kind,
+                debt_size_estimate,
+                current_bound_at,
+                last_finalized_at,
+                debt_updated_at,
+                last_maintenance_attempt_at,
+                updated_at
+            ) VALUES ('conv', 'sess', NULL, 7, 0, NULL, 0, 1.0, NULL, NULL, NULL, 2.0);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        state = LifecycleStateStore(db_path)
+        loaded = state.get_by_session("sess")
+
+        assert loaded is not None
+        assert loaded.current_session_id == "sess"
+        assert loaded.current_frontier_store_id == 7
+        assert loaded.last_rollover_at is None
+        assert loaded.last_reset_at is None
+
+        columns = {
+            row[1]
+            for row in state._conn.execute("PRAGMA table_info(lcm_lifecycle_state)").fetchall()
+        }
+        assert {"last_rollover_at", "last_reset_at"} <= columns
+
+        state.close()
+
+    def test_lifecycle_fragmentation_stats_compare_lifecycle_to_lcm_content_and_state_db(self, tmp_path):
+        db_path = tmp_path / "lifecycle-fragmentation.db"
+        state_db = tmp_path / "state.db"
+        # Initialize all shared LCM tables; fragmentation diagnostics compare
+        # lifecycle rows against raw-message and summary-DAG session coverage.
+        store = MessageStore(db_path)
+        dag = SummaryDAG(db_path)
+        state = LifecycleStateStore(db_path)
+        conn = state._conn
+        conn.execute(
+            """INSERT INTO messages
+               (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("message-only", "cli", "user", "message only", None, None, None, 1.0, 5, 0),
+        )
+        conn.execute(
+            """INSERT INTO summary_nodes
+               (session_id, depth, summary, token_count, source_token_count, source_ids, source_type, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("node-only", 0, "node only", 5, 5, "[]", "messages", 1.0),
+        )
+        conn.execute(
+            """INSERT INTO lcm_lifecycle_state
+               (conversation_id, current_session_id, last_finalized_session_id, current_frontier_store_id, last_finalized_frontier_store_id, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            ("conv-live", "message-only", "node-only", 0, 0, 1.0),
+        )
+        conn.execute(
+            """INSERT INTO lcm_lifecycle_state
+               (conversation_id, current_session_id, last_finalized_session_id, current_frontier_store_id, last_finalized_frontier_store_id, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            ("conv-missing", "missing-current", "missing-final", 0, 0, 1.0),
+        )
+        conn.commit()
+        state_conn = sqlite3.connect(state_db)
+        state_conn.executescript(
+            """
+            CREATE TABLE sessions (id TEXT PRIMARY KEY);
+            INSERT INTO sessions(id) VALUES ('message-only');
+            INSERT INTO sessions(id) VALUES ('state-only');
+            """
+        )
+        state_conn.commit()
+        state_conn.close()
+
+        stats = state.get_fragmentation_stats(state_db_path=state_db)
+
+        assert stats["lifecycle_rows"] == 2
+        assert stats["distinct_message_sessions"] == 1
+        assert stats["distinct_node_sessions"] == 1
+        assert stats["lifecycle_current_missing_in_messages"] == 1
+        assert stats["lifecycle_current_missing_in_lcm_any"] == 1
+        assert stats["lifecycle_last_finalized_missing_in_lcm_any"] == 1
+        assert stats["lifecycle_current_missing_in_state"] == 1
+        assert stats["lifecycle_last_finalized_missing_in_state"] == 2
+        assert stats["lcm_message_sessions_missing_in_state"] == 0
+        assert stats["lcm_node_sessions_missing_in_state"] == 1
+        assert stats["state_sessions_missing_in_lcm_any"] == 1
+        assert stats["state_db_checked"] is True
+        assert stats["state_db_error"] == ""
+
+        # Read-only diagnostic: no lifecycle rows were mutated or removed.
+        assert state.row_count() == 2
+        assert state.get_by_conversation("conv-missing").current_session_id == "missing-current"
+
+        state.close()
+
+    def test_lifecycle_fragmentation_stats_treats_last_finalized_message_session_as_referenced(self, tmp_path):
+        db_path = tmp_path / "lifecycle-finalized-message-reference.db"
+        store = MessageStore(db_path)
+        SummaryDAG(db_path)
+        state = LifecycleStateStore(db_path)
+        store.append("previous-session", {"role": "user", "content": "previous"}, source="cli")
+        store.append("current-session", {"role": "user", "content": "current"}, source="cli")
+        state.record_rollover(
+            "conversation",
+            old_session_id="previous-session",
+            new_session_id="current-session",
+        )
+
+        stats = state.get_fragmentation_stats()
+
+        assert stats["message_sessions_without_lifecycle_current"] == 1
+        assert stats["message_sessions_without_lifecycle_reference"] == 0
+        assert stats["node_sessions_without_lifecycle_reference"] == 0
+
+        state.close()
+
+    def test_lifecycle_fragmentation_stats_reports_existing_malformed_state_db(self, tmp_path):
+        db_path = tmp_path / "lifecycle-malformed-state.db"
+        state_db = tmp_path / "state.db"
+        MessageStore(db_path)
+        SummaryDAG(db_path)
+        state = LifecycleStateStore(db_path)
+        state_db.write_text("not sqlite")
+
+        stats = state.get_fragmentation_stats(state_db_path=state_db)
+
+        assert stats["state_db_checked"] is True
+        assert stats["state_db_error"]
+        assert stats["read_only"] is True
+        assert state.row_count() == 0
+
+        state.close()
+
     def test_record_debt_and_clear_debt(self, tmp_path):
         state = LifecycleStateStore(tmp_path / "lifecycle-debt.db")
         bound = state.bind_session("sess-1")
@@ -1292,6 +1766,30 @@ class TestSummaryDAG:
     @pytest.fixture
     def dag(self, tmp_path):
         return SummaryDAG(tmp_path / "test.db")
+
+    def _assert_write_lock_obtainable(self, db_path):
+        conn = sqlite3.connect(db_path, timeout=0.1)
+        conn.execute("PRAGMA busy_timeout=100")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def test_noop_write_helpers_do_not_leave_database_locked(self, tmp_path):
+        db_path = tmp_path / "noop-write-lock.db"
+        dag = SummaryDAG(db_path)
+
+        assert dag.reassign_session_nodes("missing-old", "missing-new") == 0
+        self._assert_write_lock_obtainable(db_path)
+
+        assert dag.delete_session_nodes("missing-session") == 0
+        self._assert_write_lock_obtainable(db_path)
+
+        assert dag.delete_below_depth("missing-session", 1) == 0
+        self._assert_write_lock_obtainable(db_path)
+
+        dag.close()
 
     def test_add_and_get(self, dag):
         node = SummaryNode(

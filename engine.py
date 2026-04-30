@@ -21,6 +21,7 @@ from .externalize import (
     build_transcript_gc_placeholder,
     maybe_externalize_tool_output,
     find_externalized_payload_for_message,
+    reassign_externalized_payloads,
 )
 from .extraction import (
     extract_before_compaction,
@@ -34,11 +35,92 @@ from .session_patterns import (
     matches_session_pattern,
 )
 from .lifecycle_state import LifecycleStateStore
+from .message_content import normalize_content_value
 from .store import MessageStore
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 from . import tools as lcm_tools
 
 logger = logging.getLogger(__name__)
+
+_PLUGIN_ROOT = Path(__file__).resolve().parent
+_PLUGIN_METADATA: dict[str, str] | None = None
+
+
+def _strip_metadata_scalar(value: str) -> str:
+    return value.strip().strip('"').strip("'")
+
+
+def _plugin_metadata() -> dict[str, str]:
+    """Return plugin identity from the loaded code tree."""
+    global _PLUGIN_METADATA
+    if _PLUGIN_METADATA is not None:
+        return dict(_PLUGIN_METADATA)
+
+    metadata = {"name": "hermes-lcm", "version": "unknown"}
+    manifest = _PLUGIN_ROOT / "plugin.yaml"
+    try:
+        for line in manifest.read_text(encoding="utf-8").splitlines():
+            key, sep, raw_value = line.partition(":")
+            if not sep:
+                continue
+            key = key.strip()
+            if key in {"name", "version"}:
+                metadata[key] = _strip_metadata_scalar(raw_value)
+    except OSError:
+        logger.debug("LCM plugin manifest not readable at %s", manifest)
+
+    _PLUGIN_METADATA = metadata
+    return dict(metadata)
+
+
+_SYNTHETIC_ASSISTANT_NOISE = {
+    "ack",
+    "acknowledged",
+    "heartbeat",
+    "heartbeat ack",
+    "keepalive",
+    "keep alive",
+    "pong",
+}
+
+
+def _tool_call_id(tool_call: Any) -> str:
+    if not isinstance(tool_call, dict):
+        return ""
+    value = tool_call.get("id") or tool_call.get("tool_call_id")
+    return str(value).strip() if value else ""
+
+
+def _assistant_tool_call_ids(messages: List[Dict[str, Any]]) -> set[str]:
+    call_ids: set[str] = set()
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        for tool_call in msg.get("tool_calls") or []:
+            call_id = _tool_call_id(tool_call)
+            if call_id:
+                call_ids.add(call_id)
+    return call_ids
+
+
+def _matched_tool_call_ids(messages: List[Dict[str, Any]]) -> set[str]:
+    assistant_call_ids = _assistant_tool_call_ids(messages)
+    tool_result_ids: set[str] = set()
+    for msg in messages:
+        if msg.get("role") == "tool":
+            tool_call_id = str(msg.get("tool_call_id") or "").strip()
+            if tool_call_id:
+                tool_result_ids.add(tool_call_id)
+    return assistant_call_ids & tool_result_ids
+
+
+def _is_synthetic_assistant_noise(content: str) -> bool:
+    normalized = re.sub(r"\s+", " ", (content or "").strip()).lower()
+    if not normalized:
+        return True
+    normalized = normalized.strip("`*_ ")
+    bracketless = normalized.strip("[](){} ")
+    return normalized in _SYNTHETIC_ASSISTANT_NOISE or bracketless in _SYNTHETIC_ASSISTANT_NOISE
 
 
 class LCMEngine(ContextEngine):
@@ -105,6 +187,12 @@ class LCMEngine(ContextEngine):
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
+        self.last_input_tokens = 0
+        self.last_output_tokens = 0
+        self.last_cache_read_tokens = 0
+        self.last_cache_write_tokens = 0
+        self.last_reasoning_tokens = 0
+        self.cache_metrics_available = False
         self.compression_count = 0
         # run_agent.py reads these for preflight checks
         self.protect_first_n = 3
@@ -117,6 +205,9 @@ class LCMEngine(ContextEngine):
         self._last_overflow_recovery_failed = False
         self._last_condensation_suppressed_reason = ""
         self._logged_filter_config = False
+        self._pending_reset_session_id: str = ""
+        self._pending_reset_conversation_id: str = ""
+        self._pending_reset_frontier_store_id: int = 0
 
     @property
     def name(self) -> str:
@@ -125,9 +216,25 @@ class LCMEngine(ContextEngine):
     # -- ContextEngine required methods ------------------------------------
 
     def update_from_response(self, usage: Dict[str, Any]) -> None:
-        self.last_prompt_tokens = usage.get("prompt_tokens", 0)
-        self.last_completion_tokens = usage.get("completion_tokens", 0)
-        self.last_total_tokens = usage.get("total_tokens", 0)
+        self.last_prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+        self.last_completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+        self.last_total_tokens = int(usage.get("total_tokens", 0) or 0)
+
+        cache_keys = {"cache_read_tokens", "cache_write_tokens"}
+        self.cache_metrics_available = any(key in usage for key in cache_keys)
+        self.last_input_tokens = int(usage.get("input_tokens", self.last_prompt_tokens) or 0)
+        self.last_output_tokens = int(
+            usage.get("output_tokens", self.last_completion_tokens) or 0
+        )
+        self.last_cache_read_tokens = int(usage.get("cache_read_tokens", 0) or 0)
+        self.last_cache_write_tokens = int(usage.get("cache_write_tokens", 0) or 0)
+        self.last_reasoning_tokens = int(usage.get("reasoning_tokens", 0) or 0)
+
+    @property
+    def cache_read_ratio(self) -> float:
+        if self.last_prompt_tokens <= 0:
+            return 0.0
+        return self.last_cache_read_tokens / self.last_prompt_tokens
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
         if self._session_ignored or self._session_stateless:
@@ -489,6 +596,34 @@ class LCMEngine(ContextEngine):
             self._last_compacted_store_id,
         )
 
+    def _clear_pending_reset_boundary(self) -> None:
+        self._pending_reset_session_id = ""
+        self._pending_reset_conversation_id = ""
+        self._pending_reset_frontier_store_id = 0
+
+    def _finalize_pending_reset_boundary(self, session_id: str) -> None:
+        if not self._pending_reset_session_id:
+            return
+        if self._pending_reset_session_id != session_id:
+            self._clear_pending_reset_boundary()
+            return
+        if not self._pending_reset_conversation_id:
+            self._clear_pending_reset_boundary()
+            return
+        state = self._lifecycle.get_by_conversation(self._pending_reset_conversation_id)
+        frontier_store_id = self._pending_reset_frontier_store_id
+        if state is not None and state.current_session_id == session_id:
+            frontier_store_id = max(
+                frontier_store_id,
+                int(state.current_frontier_store_id or 0),
+            )
+        self._lifecycle.finalize_session(
+            self._pending_reset_conversation_id,
+            self._pending_reset_session_id,
+            frontier_store_id=frontier_store_id,
+        )
+        self._clear_pending_reset_boundary()
+
     def _raw_backlog_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         n = len(messages)
         fresh_tail_start = max(0, n - self._config.fresh_tail_count)
@@ -536,13 +671,27 @@ class LCMEngine(ContextEngine):
         if self._has_raw_backlog_debt():
             self._lifecycle.clear_debt(self._conversation_id)
 
-    def on_session_start(self, session_id: str, **kwargs) -> None:
-        self._session_id = session_id
-        self._session_platform = str(kwargs.get("platform") or "")
-        self._ingest_cursor = 0
+    def _reset_session_scoped_runtime_state(self) -> None:
+        self.compression_count = 0
+        self.last_prompt_tokens = 0
+        self.last_completion_tokens = 0
+        self.last_total_tokens = 0
+        self.last_input_tokens = 0
+        self.last_output_tokens = 0
+        self.last_cache_read_tokens = 0
+        self.last_cache_write_tokens = 0
+        self.last_reasoning_tokens = 0
+        self.cache_metrics_available = False
         self._last_compacted_store_id = 0
+        self._ingest_cursor = 0
+        self._context_probed = False
+        self._context_probe_persistable = False
         self._last_overflow_recovery_failed = False
         self._last_condensation_suppressed_reason = ""
+
+    def _apply_session_start_metadata(self, session_id: str, kwargs: Dict[str, Any]) -> None:
+        self._session_id = session_id
+        self._session_platform = str(kwargs.get("platform") or "")
         self._refresh_session_filters()
         if "hermes_home" in kwargs:
             self._hermes_home = kwargs["hermes_home"]
@@ -552,6 +701,149 @@ class LCMEngine(ContextEngine):
             self.threshold_tokens = int(
                 self.context_length * self._config.context_threshold
             )
+
+    def _continue_compression_boundary(
+        self,
+        session_id: str,
+        old_session_id: str,
+        kwargs: Dict[str, Any],
+    ) -> None:
+        previous_session_id = self._session_id
+        requested_conversation_id = kwargs.get("conversation_id")
+        old_state = self._lifecycle.get_by_session(old_session_id)
+        source_session_id = old_session_id
+        source_state = old_state
+
+        if previous_session_id and previous_session_id != old_session_id:
+            bound_state = self._lifecycle.get_by_session(previous_session_id)
+            bound_conversation_matches = bool(
+                bound_state
+                and (not self._conversation_id or bound_state.conversation_id == self._conversation_id)
+                and (
+                    not requested_conversation_id
+                    or bound_state.conversation_id == requested_conversation_id
+                )
+            )
+            bound_is_active_source = bool(
+                bound_state and bound_state.current_session_id == previous_session_id
+            )
+            bound_is_finalized_source = bool(
+                bound_state
+                and bound_state.current_session_id is None
+                and bound_state.last_finalized_session_id == previous_session_id
+            )
+            bound_has_summary_nodes = bool(self._dag.get_session_nodes(previous_session_id))
+            if (
+                bound_conversation_matches
+                and (bound_is_active_source or bound_is_finalized_source)
+                and bound_has_summary_nodes
+            ):
+                source_session_id = previous_session_id
+                source_state = bound_state
+                logger.warning(
+                    "LCM compression boundary using bound session %s as carry-over source; host old_session_id=%s does not match",
+                    previous_session_id,
+                    old_session_id,
+                )
+            else:
+                source_session_id = ""
+                source_state = None
+
+        conversation_id = (
+            kwargs.get("conversation_id")
+            or self._conversation_id
+            or (source_state.conversation_id if source_state else None)
+            or source_session_id
+            or old_session_id
+            or session_id
+        )
+        frontier = max(
+            int(self._last_compacted_store_id or 0),
+            int(source_state.current_frontier_store_id if source_state else 0),
+            int(source_state.last_finalized_frontier_store_id if source_state else 0),
+            int(
+                self._pending_reset_frontier_store_id
+                if self._pending_reset_session_id
+                and self._pending_reset_session_id in {source_session_id, old_session_id, previous_session_id}
+                else 0
+            ),
+        )
+        can_reassign = bool(
+            source_session_id
+            and session_id
+            and source_session_id != session_id
+        )
+
+        if can_reassign:
+            self._lifecycle.finalize_session(
+                conversation_id,
+                source_session_id,
+                frontier_store_id=frontier,
+            )
+            moved_messages = self._store.reassign_session_messages(source_session_id, session_id)
+            moved_nodes = self._dag.reassign_session_nodes(source_session_id, session_id)
+            moved_payloads = reassign_externalized_payloads(
+                source_session_id,
+                session_id,
+                config=self._config,
+                hermes_home=self._hermes_home,
+            )
+            logger.debug(
+                "LCM compression boundary continued %s -> %s: moved %d messages, %d DAG nodes, %d externalized payloads",
+                source_session_id,
+                session_id,
+                moved_messages,
+                moved_nodes,
+                moved_payloads,
+            )
+        elif old_session_id:
+            logger.warning(
+                "LCM compression boundary skipped carry-over: old_session_id=%s does not match bound session=%s",
+                old_session_id,
+                previous_session_id,
+            )
+            self._finalize_pending_reset_boundary(previous_session_id)
+            self._reset_session_scoped_runtime_state()
+            self._apply_session_start_metadata(session_id, kwargs)
+            self._bind_lifecycle_state(
+                session_id,
+                conversation_id=kwargs.get("conversation_id"),
+            )
+            self._clear_pending_reset_boundary()
+            self._log_session_filter_diagnostics()
+            return
+
+        self._apply_session_start_metadata(session_id, kwargs)
+        self._bind_lifecycle_state(session_id, conversation_id=conversation_id)
+        if frontier > 0:
+            state = self._lifecycle.advance_frontier(
+                self._conversation_id,
+                session_id,
+                frontier,
+            )
+            if state is not None:
+                self._last_compacted_store_id = state.current_frontier_store_id
+        self._clear_pending_reset_boundary()
+        self._log_session_filter_diagnostics()
+
+    def on_session_start(self, session_id: str, **kwargs) -> None:
+        boundary_reason = str(kwargs.get("boundary_reason") or "")
+        old_session_id = str(kwargs.get("old_session_id") or "")
+        if boundary_reason == "compression" and old_session_id and old_session_id != session_id:
+            self._continue_compression_boundary(session_id, old_session_id, kwargs)
+            return
+
+        previous_session_id = self._session_id
+        if previous_session_id and previous_session_id != session_id:
+            self._finalize_pending_reset_boundary(previous_session_id)
+            self._reset_session_scoped_runtime_state()
+        else:
+            self._clear_pending_reset_boundary()
+            self._ingest_cursor = 0
+            self._last_compacted_store_id = 0
+            self._last_overflow_recovery_failed = False
+            self._last_condensation_suppressed_reason = ""
+        self._apply_session_start_metadata(session_id, kwargs)
         self._bind_lifecycle_state(
             session_id,
             conversation_id=kwargs.get("conversation_id"),
@@ -568,14 +860,12 @@ class LCMEngine(ContextEngine):
         )
 
     def on_session_reset(self) -> None:
+        self._pending_reset_session_id = self._session_id
+        self._pending_reset_conversation_id = self._conversation_id
+        self._pending_reset_frontier_store_id = self._last_compacted_store_id
         super().on_session_reset()
         self._lifecycle.record_reset(self._conversation_id)
-        self._last_compacted_store_id = 0
-        self._ingest_cursor = 0
-        self._context_probed = False
-        self._context_probe_persistable = False
-        self._last_overflow_recovery_failed = False
-        self._last_condensation_suppressed_reason = ""
+        self._reset_session_scoped_runtime_state()
 
         # Retain DAG nodes across sessions based on config.
         #   -1  → keep all nodes
@@ -625,11 +915,30 @@ class LCMEngine(ContextEngine):
         4. optionally move retained summaries into the new session
         """
         previous_messages = previous_messages or []
+        boundary_reason = str(kwargs.get("boundary_reason") or "")
         conversation_id = self._conversation_id or old_session_id or new_session_id
         bound_session_id = self._session_id
         can_carry_over = bool(
             old_session_id and bound_session_id and old_session_id == bound_session_id
         )
+
+        if carry_over_context and boundary_reason == "compression" and old_session_id and old_session_id != new_session_id:
+            before_node_ids = {node.node_id for node in self._dag.get_session_nodes(new_session_id)}
+            if can_carry_over:
+                self.on_session_end(old_session_id, previous_messages)
+            else:
+                logger.warning(
+                    "LCM compression rollover old_session_id=%s does not match bound session=%s; using boundary handler fallback",
+                    old_session_id,
+                    bound_session_id,
+                )
+            self.on_session_start(
+                new_session_id,
+                old_session_id=old_session_id,
+                **kwargs,
+            )
+            after_node_ids = {node.node_id for node in self._dag.get_session_nodes(new_session_id)}
+            return len(after_node_ids - before_node_ids)
 
         if old_session_id and can_carry_over:
             self.on_session_end(old_session_id, previous_messages)
@@ -681,14 +990,84 @@ class LCMEngine(ContextEngine):
             return handler(args, engine=self)
         return json.dumps({"error": f"Unknown LCM tool: {name}"})
 
+    def _database_path_source(self) -> str:
+        if self._config.database_path:
+            return "config.database_path"
+        if self._hermes_home:
+            return "hermes_home"
+        return "default_home"
+
+    def get_runtime_identity(self) -> Dict[str, Any]:
+        """Return operator-facing identity for the loaded LCM runtime."""
+        metadata = _plugin_metadata()
+        lifecycle_state = None
+        lifecycle_error = ""
+        if self._conversation_id:
+            try:
+                lifecycle_state = self._lifecycle.get_by_conversation(self._conversation_id)
+            except Exception as exc:  # pragma: no cover - defensive
+                lifecycle_error = str(exc)
+
+        identity: Dict[str, Any] = {
+            "engine": self.name,
+            "plugin_name": metadata.get("name", "hermes-lcm"),
+            "plugin_version": metadata.get("version", "unknown"),
+            "plugin_path": str(_PLUGIN_ROOT),
+            "module_path": str(Path(__file__).resolve()),
+            "hermes_home": str(self._hermes_home or ""),
+            "database_path": str(self._store.db_path),
+            "database_path_source": self._database_path_source(),
+            "session_id": self._session_id,
+            "session_platform": self._session_platform,
+            "session_bound": bool(self._session_id),
+            "conversation_id": self._conversation_id,
+            "lifecycle_current_session_id": "",
+            "lifecycle_last_finalized_session_id": "",
+        }
+        if lifecycle_state is not None:
+            identity.update({
+                "lifecycle_current_session_id": lifecycle_state.current_session_id or "",
+                "lifecycle_last_finalized_session_id": lifecycle_state.last_finalized_session_id or "",
+            })
+        if lifecycle_error:
+            identity["lifecycle_error"] = lifecycle_error
+        return identity
+
     def get_status(self) -> Dict[str, Any]:
         status = super().get_status()
+        status.update({
+            "compression_count": self.compression_count,
+            "last_prompt_tokens": self.last_prompt_tokens,
+            "last_completion_tokens": self.last_completion_tokens,
+            "last_total_tokens": self.last_total_tokens,
+            "last_input_tokens": self.last_input_tokens,
+            "last_output_tokens": self.last_output_tokens,
+            "last_cache_read_tokens": self.last_cache_read_tokens,
+            "last_cache_write_tokens": self.last_cache_write_tokens,
+            "last_reasoning_tokens": self.last_reasoning_tokens,
+            "cache_metrics_available": self.cache_metrics_available,
+            "cache_read_ratio": round(self.cache_read_ratio, 4),
+            "context_length": self.context_length,
+            "threshold_tokens": self.threshold_tokens,
+        })
         lifecycle_state = self._lifecycle.get_by_conversation(self._conversation_id)
         status["engine"] = "lcm"
+        status["runtime_identity"] = self.get_runtime_identity()
         try:
             status["source_lineage"] = self._store.get_source_stats(self._session_id or None)
         except Exception as exc:  # pragma: no cover - defensive
             status["source_lineage"] = {"error": str(exc)}
+        try:
+            state_db_path = (
+                Path(self._hermes_home).expanduser() / "state.db"
+                if self._hermes_home
+                else Path(self._store.db_path).parent / "state.db"
+            )
+            status["lifecycle_fragmentation"] = self._lifecycle.get_fragmentation_stats(
+                state_db_path=state_db_path
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            status["lifecycle_fragmentation"] = {"error": str(exc), "read_only": True}
         if self._session_id:
             status["store_messages"] = self._store.get_session_count(self._session_id)
             status["dag_nodes"] = len(self._dag.get_session_nodes(self._session_id))
@@ -834,7 +1213,7 @@ class LCMEngine(ContextEngine):
         store_idx = 0
         for msg in messages:
             role = msg.get("role", "")
-            content = msg.get("content") or ""
+            content = normalize_content_value(msg.get("content")) or ""
             probe_idx = store_idx
             while probe_idx < len(candidates):
                 stored = candidates[probe_idx]
@@ -915,13 +1294,15 @@ class LCMEngine(ContextEngine):
     def _serialize_messages(self, messages: List[Dict[str, Any]]) -> str:
         """Serialize messages into labeled text for the summarizer."""
         parts = []
+        assistant_tool_ids = _assistant_tool_call_ids(messages)
+        matched_tool_ids = _matched_tool_call_ids(messages)
         for msg in messages:
             role = msg.get("role", "unknown")
             content = msg.get("content") or ""
             content = sanitize_pre_compaction_content(content)
 
             if role == "tool":
-                tool_id = msg.get("tool_call_id", "")
+                tool_id = str(msg.get("tool_call_id") or "").strip()
                 externalized = maybe_externalize_tool_output(
                     content,
                     tool_call_id=tool_id,
@@ -937,12 +1318,20 @@ class LCMEngine(ContextEngine):
                 continue
 
             if role == "assistant":
+                tool_calls = msg.get("tool_calls", [])
+                matched_tool_calls = [
+                    tc for tc in tool_calls
+                    if not _tool_call_id(tc) or _tool_call_id(tc) in matched_tool_ids
+                ]
+                if _is_synthetic_assistant_noise(content):
+                    if not matched_tool_calls:
+                        continue
+                    content = ""
                 if len(content) > 3000:
                     content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
-                tool_calls = msg.get("tool_calls", [])
-                if tool_calls:
+                if matched_tool_calls:
                     tc_parts = []
-                    for tc in tool_calls:
+                    for tc in matched_tool_calls:
                         if isinstance(tc, dict):
                             fn = tc.get("function", {})
                             name = fn.get("name", "?")

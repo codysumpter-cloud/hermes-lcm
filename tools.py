@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from pathlib import Path
 from typing import Any, Dict, TYPE_CHECKING
 
 from .externalize import (
@@ -13,6 +14,7 @@ from .externalize import (
     load_externalized_payload,
 )
 from .extraction import sanitize_pre_compaction_content
+from .model_routing import apply_lcm_model_route
 from .search_query import AGE_DECAY_RATE, normalize_search_sort
 
 if TYPE_CHECKING:
@@ -52,6 +54,38 @@ def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple:
     if result.get("type") == "message":
         return (-sort_timestamp, type_bias, role_bias, rank_value, 0.0, float("inf"))
     return (-sort_timestamp, type_bias, 0, rank_value, 0.0, role_bias)
+
+
+def _state_db_path_for_engine(engine: "LCMEngine") -> Path:
+    hermes_home = getattr(engine, "_hermes_home", "") or ""
+    if hermes_home:
+        return Path(hermes_home).expanduser() / "state.db"
+    db_path = Path(getattr(engine._store, "db_path", Path.home() / ".hermes" / "lcm.db"))
+    return db_path.parent / "state.db"
+
+
+def _has_lifecycle_fragmentation(stats: dict[str, Any]) -> bool:
+    direct_mismatch_keys = (
+        "lifecycle_current_missing_in_lcm_any",
+        "lifecycle_last_finalized_missing_in_lcm_any",
+        "lifecycle_current_missing_in_state",
+        "lifecycle_last_finalized_missing_in_state",
+        "lcm_message_sessions_missing_in_state",
+        "lcm_node_sessions_missing_in_state",
+    )
+    lifecycle_rows = int(stats.get("lifecycle_rows", 0) or 0)
+    missing_lifecycle_reference_keys = (
+        "message_sessions_without_lifecycle_reference",
+        "node_sessions_without_lifecycle_reference",
+    )
+    return (
+        any(int(stats.get(key, 0) or 0) > 0 for key in direct_mismatch_keys)
+        or (
+            lifecycle_rows > 0
+            and any(int(stats.get(key, 0) or 0) > 0 for key in missing_lifecycle_reference_keys)
+        )
+        or (bool(stats.get("state_db_checked")) and bool(stats.get("state_db_error")))
+    )
 
 
 def _require_engine(kwargs: Dict[str, Any]) -> "LCMEngine | None":
@@ -231,13 +265,13 @@ def _synthesize_expansion_answer(
         "max_tokens": max_tokens,
         "timeout": timeout,
     }
-    if model:
-        call_kwargs["model"] = model
+    apply_lcm_model_route(call_kwargs, model)
     response = call_llm(**call_kwargs)
     content = response.choices[0].message.content
     if not isinstance(content, str):
         content = str(content) if content else ""
-    return content.strip()
+    from .escalation import _strip_reasoning_blocks
+    return _strip_reasoning_blocks(content).strip()
 
 
 def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
@@ -330,16 +364,18 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         result.pop("_sort_rank", None)
         result.pop("_sort_directness", None)
         result.pop("_hybrid_summary_override", None)
-    return json.dumps(
-        {
-            "query": query,
-            "sort": sort,
-            "session_scope": session_scope,
-            "source": source,
-            "total_results": len(results),
-            "results": results[:limit],
-        }
-    )
+    response = {
+        "query": query,
+        "sort": sort,
+        "session_scope": session_scope,
+        "source": source,
+        "total_results": len(results),
+        "results": results[:limit],
+    }
+    if requested_session_scope != "current":
+        response["ignored_session_scope"] = requested_session_scope
+        response["scope_note"] = "lcm_grep is current-session only; use session_search for broad cross-session recall."
+    return json.dumps(response)
 
 
 def lcm_describe(args: Dict[str, Any], **kwargs) -> str:
@@ -494,8 +530,9 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
     nodes = []
     if raw_node_ids:
         for node_id in raw_node_ids:
-            parsed_node_id, node_id_error = _parse_int_arg("node_ids", node_id)
-            if node_id_error:
+            try:
+                parsed_node_id = int(node_id)
+            except (TypeError, ValueError):
                 return json.dumps({"error": "node_ids must contain only integers"})
             node = _get_session_node(engine, parsed_node_id)
             if node is not None:
@@ -520,15 +557,53 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
     for node in nodes[:max_results]:
         context_blocks.extend(_collect_context_blocks_for_node(engine, node, max_tokens=max_tokens))
 
+    selected_nodes = nodes[:max_results]
+    matches = [
+        {
+            "node_id": node.node_id,
+            "depth": node.depth,
+            "summary": node.summary[:300],
+            "expand_hint": node.expand_hint,
+        }
+        for node in selected_nodes
+    ]
+    node_ids = [node.node_id for node in selected_nodes]
+
+    def _degraded_payload(reason: str, *, include_timeout: bool = False) -> str:
+        payload: Dict[str, Any] = {
+            "prompt": prompt,
+            "query": query,
+            "error": reason,
+            "degraded": True,
+            "model": model,
+            "node_ids": node_ids,
+            "matches": matches,
+        }
+        if include_timeout:
+            payload["timeout_seconds"] = timeout
+        return json.dumps(payload)
+
     model = engine._config.expansion_model or engine._config.summary_model or ""
     timeout = engine._config.expansion_timeout_ms / 1000
-    answer = _synthesize_expansion_answer(
-        prompt=prompt,
-        context_blocks=context_blocks,
-        model=model,
-        max_tokens=max_tokens,
-        timeout=timeout,
-    )
+    try:
+        answer = _synthesize_expansion_answer(
+            prompt=prompt,
+            context_blocks=context_blocks,
+            model=model,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
+    except TimeoutError:
+        logger.warning("LCM expand_query synthesis timed out after %.3fs", timeout)
+        return _degraded_payload(
+            f"lcm_expand_query synthesis timed out after {timeout:.3g}s",
+            include_timeout=True,
+        )
+
+    answer = str(answer).strip() if answer is not None else ""
+    if not answer:
+        logger.warning("LCM expand_query synthesis returned an empty answer")
+        return _degraded_payload("lcm_expand_query synthesis returned an empty answer")
 
     return json.dumps(
         {
@@ -536,16 +611,8 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             "query": query,
             "answer": answer,
             "model": model,
-            "node_ids": [node.node_id for node in nodes[:max_results]],
-            "matches": [
-                {
-                    "node_id": node.node_id,
-                    "depth": node.depth,
-                    "summary": node.summary[:300],
-                    "expand_hint": node.expand_hint,
-                }
-                for node in nodes[:max_results]
-            ],
+            "node_ids": node_ids,
+            "matches": matches,
         }
     )
 
@@ -558,7 +625,10 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
 
     session_id = engine._session_id
     if not session_id:
-        return json.dumps({"error": "No active session"})
+        return json.dumps({
+            "error": "No active session",
+            "runtime_identity": engine.get_runtime_identity(),
+        })
 
     # Store stats
     store_messages = engine._store.get_session_count(session_id)
@@ -578,7 +648,9 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
     compression_ratio = round(total_source_tokens / total_dag_tokens, 1) if total_dag_tokens > 0 else 0
     full_status = engine.get_status()
     lifecycle = full_status.get("lifecycle")
+    lifecycle_fragmentation = full_status.get("lifecycle_fragmentation")
     source_lineage = full_status.get("source_lineage")
+    runtime_identity = full_status.get("runtime_identity")
 
     return json.dumps({
         "session_id": session_id,
@@ -586,6 +658,13 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         "context_length": engine.context_length,
         "threshold_tokens": engine.threshold_tokens,
         "last_prompt_tokens": engine.last_prompt_tokens,
+        "last_input_tokens": engine.last_input_tokens,
+        "last_output_tokens": engine.last_output_tokens,
+        "last_cache_read_tokens": engine.last_cache_read_tokens,
+        "last_cache_write_tokens": engine.last_cache_write_tokens,
+        "last_reasoning_tokens": engine.last_reasoning_tokens,
+        "cache_metrics_available": engine.cache_metrics_available,
+        "cache_read_ratio": round(engine.cache_read_ratio, 4),
         "store": {
             "messages": store_messages,
             "estimated_tokens": store_tokens,
@@ -618,7 +697,9 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "stateless": engine._session_stateless,
         },
         "source_lineage": source_lineage,
+        "runtime_identity": runtime_identity,
         "lifecycle": lifecycle,
+        "lifecycle_fragmentation": lifecycle_fragmentation,
     })
 
 
@@ -719,10 +800,9 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     # 5. Source-lineage hygiene
     try:
         source_stats = engine._store.get_source_stats()
-        legacy_blank_messages = source_stats["legacy_blank_source_messages"]
         checks.append({
             "check": "source_lineage_hygiene",
-            "status": "pass" if legacy_blank_messages == 0 else "warn",
+            "status": "pass",
             "detail": {
                 **source_stats,
                 "normalization_mode": "backcompat-normalization",
@@ -735,7 +815,24 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
             "detail": str(e),
         })
 
-    # 6. Context pressure
+    # 6. Lifecycle/session fragmentation
+    try:
+        lifecycle_fragmentation = engine._lifecycle.get_fragmentation_stats(
+            state_db_path=_state_db_path_for_engine(engine)
+        )
+        checks.append({
+            "check": "lifecycle_fragmentation",
+            "status": "warn" if _has_lifecycle_fragmentation(lifecycle_fragmentation) else "pass",
+            "detail": lifecycle_fragmentation,
+        })
+    except Exception as e:
+        checks.append({
+            "check": "lifecycle_fragmentation",
+            "status": "fail",
+            "detail": str(e),
+        })
+
+    # 7. Context pressure
     if engine.context_length > 0:
         usage_pct = round(engine.last_prompt_tokens / engine.context_length * 100, 1) if engine.context_length else 0
         threshold_pct = round(c.context_threshold * 100, 1)

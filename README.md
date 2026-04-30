@@ -165,7 +165,7 @@ Typical output looks like:
 
 ```
 Plugins (1):
-  ✓ hermes-lcm v0.7.0 (6 tools)
+  ✓ hermes-lcm v0.7.1 (6 tools)
 
 Provider Plugins:
   Context Engine: lcm
@@ -179,6 +179,34 @@ At runtime the tool list should include:
 - `lcm_expand_query`
 - `lcm_status`
 - `lcm_doctor`
+
+## Troubleshooting signals
+
+### `hermes plugins` shows `lcm (not found)` but LCM tools still exist
+
+If all of these are true:
+
+- `plugins.enabled` contains `hermes-lcm`
+- `context.engine: lcm` is set
+- the runtime exposes LCM tools (or `/lcm` if enabled)
+
+then LCM itself is loaded.
+
+In that situation, a `Context Engine: lcm (not found)` line in `hermes plugins` is a **Hermes host discovery/UI issue**, not proof that `hermes-lcm` failed to load.
+
+Treat it as a host-side mismatch between the picker/status surface and the live runtime. The fix belongs in Hermes host discovery/UI, not in LCM storage or compaction logic.
+
+### `/lcm status` shows unbound / zero-looking session details right after restart
+
+Right after a fresh Hermes restart, `/lcm status` may show things like:
+
+- `session_id: (unbound)`
+- `session_platform: (unbound)`
+- `threshold_tokens: (uninitialized)`
+
+That means the current Hermes process has not yet bound LCM to a live session. It does **not** mean the database is empty or that LCM lost prior history.
+
+After restart, send one normal Hermes message first, then re-run `lcm_status` or `/lcm status` if you want live per-session fields such as `dag_nodes` and `store_messages`.
 
 ## Legacy install path
 
@@ -224,8 +252,8 @@ Environment variables (all optional):
 | `LCM_LARGE_OUTPUT_EXTERNALIZATION_THRESHOLD_CHARS` | `12000` | Character threshold above which tool results are externalized |
 | `LCM_LARGE_OUTPUT_EXTERNALIZATION_PATH` | `~/.hermes/lcm-large-outputs` | Override storage directory for externalized payloads |
 | `LCM_LARGE_OUTPUT_TRANSCRIPT_GC_ENABLED` | `false` | Opt-in rewrite of already-externalized summarized tool-result transcript rows to compact GC placeholders |
-| `LCM_SUMMARY_MODEL` | *(auxiliary)* | Override model for summarization |
-| `LCM_EXPANSION_MODEL` | *(summary model / auxiliary)* | Override model for `lcm_expand_query` synthesis |
+| `LCM_SUMMARY_MODEL` | *(auxiliary)* | Override model for summarization. Slash-bearing aggregator model slugs such as `meta-llama/...`, `anthropic/...`, and unresolved `cerebras/...` stay model-only. |
+| `LCM_EXPANSION_MODEL` | *(summary model / auxiliary)* | Override model for `lcm_expand_query` synthesis. Uses the same routing rules as `LCM_SUMMARY_MODEL`. |
 | `LCM_SUMMARY_TIMEOUT_MS` | `60000` | Timeout for a single model-backed summarization call |
 | `LCM_EXPANSION_TIMEOUT_MS` | `120000` | Timeout for `lcm_expand_query` answer synthesis |
 | `LCM_DATABASE_PATH` | `~/.hermes/lcm.db` | SQLite database path (auto profile-scoped) |
@@ -233,6 +261,38 @@ Environment variables (all optional):
 | `LCM_ENABLE_SLASH_COMMAND` | `false` | Opt-in registration for `/lcm` gateway slash commands (recommended only for trusted operator contexts) |
 
 The point-8 compaction knobs are intentionally opt-in. `cache_friendly_*` is a plugin-local prompt-stability heuristic, not a claim that Hermes currently passes true prompt-cache metrics into `hermes-lcm`.
+
+Provider-prefixed LCM model overrides are conservative. `cerebras/gpt-oss-120b` routes as `provider=cerebras`, `model=gpt-oss-120b` only when the Hermes host can resolve `cerebras` as a built-in provider or as a named custom provider in `providers:` / `custom_providers`. If not, it remains `model=cerebras/gpt-oss-120b` so aggregator-style slugs do not accidentally become unknown direct providers.
+
+### Threshold ownership when `context.engine: lcm` is active
+
+This is the easy place to get crossed wires.
+
+When Hermes is configured with:
+
+```yaml
+context:
+  engine: lcm
+```
+
+`hermes-lcm` becomes the active context engine for compaction decisions.
+
+That means:
+
+- `LCM_CONTEXT_THRESHOLD` is the threshold that LCM uses to decide when to compact
+- Hermes core `compression.threshold` belongs to the built-in `ContextCompressor`, not to LCM
+- Hermes core `compression.enabled` is still the global on/off gate for whether compaction is allowed at all, so leave it enabled when using LCM
+
+Practical rule:
+
+- if you want LCM to compact earlier or later, tune `LCM_CONTEXT_THRESHOLD`
+- do **not** expect changing Hermes `compression.threshold` to be the normal way to tune LCM behavior
+
+Important operator note:
+
+Some Hermes host builds still print the host-side compression percentage in startup/status surfaces even when LCM is the active engine. If that printed percentage disagrees with LCM, trust live LCM runtime status (`lcm_status` or `/lcm status`) after a normal message has initialized the session, not the startup banner text.
+
+If raising Hermes `compression.threshold` seems to change LCM behavior materially, that usually points to host-version confusion, a misleading host status surface, or another Hermes-side integration issue — not to the intended LCM threshold contract.
 
 ### Large tool-output handling
 
@@ -261,23 +321,40 @@ Hermes currently matches each pattern against multiple candidate keys for flexib
 
 That means patterns like `cron:*` can catch Hermes cron sessions today, while plain raw session-id matching still works if you know the exact IDs you want to target.
 
+## Session boundary contract
+
+`hermes-lcm` distinguishes manual new-session boundaries from Hermes compression continuations:
+
+- **Manual `/new`** should call `rollover_session(old_session_id, new_session_id, ...)`. This finalizes the old physical session, records reset/rollover lifecycle state, binds the new physical session, and applies `LCM_NEW_SESSION_RETAIN_DEPTH` before carrying retained summary nodes forward.
+- **Compression-created session splits** should call `on_session_start(new_session_id, boundary_reason="compression", old_session_id=old_session_id, ...)`. Compression is a continuation of the same logical conversation, so LCM preserves the conversation id and carries all current DAG/message state forward, including depth-0 nodes.
+- For host compatibility, `rollover_session(..., boundary_reason="compression")` is also treated as a compression continuation when `carry_over_context` is enabled, not as manual `/new` pruning. If an integration explicitly passes `carry_over_context=False`, no prior-session messages or DAG nodes are moved into the new session.
+- Older hosts that only call `on_session_reset()` followed later by `on_session_start(new_session_id, ...)` are supported by delayed reset-boundary finalization: same-session reset stays current, while a later fresh bind finalizes the previous lifecycle row with the latest known frontier.
+
 ## Agent Tools
 
 | Tool | Description |
 |------|-------------|
-| `lcm_grep` | Search raw messages AND summaries for the active/current session. Use this for intra-session recall after compaction; if you intentionally want cross-session LCM store hits, use `session_scope='all'`; otherwise prefer `session_search` for earlier separate sessions. |
+| `lcm_grep` | Search raw messages AND summaries for the active/current session. Use this for intra-session recall after compaction. For earlier separate sessions or broad cross-session history, use `session_search`. |
 | `lcm_describe` | Inspect current-session DAG structure or an `externalized_ref` payload preview without loading full payload content. No node_id/externalized_ref = session overview. |
 | `lcm_expand` | Recover original content from a current-session summary node, or open a stored `externalized_ref` payload directly. |
-| `lcm_expand_query` | Answer a question from expanded LCM context for the active/current session using either a query or explicit node_ids. For cross-session recall, prefer `session_search` first. |
-| `lcm_status` | Quick health overview — compression count, store size, DAG depth distribution, context usage, and active config. |
-| `lcm_doctor` | Run diagnostics — database integrity, FTS index sync, orphaned nodes, config validation, context pressure. |
+| `lcm_expand_query` | Answer a question from expanded LCM context for the active/current session using either a query or explicit node_ids. For cross-session recall, use `session_search` first. |
+| `lcm_status` | Quick health overview — compression count, store size, DAG depth distribution, context usage, active config, and read-only lifecycle/session fragmentation stats. |
+| `lcm_doctor` | Run diagnostics — database integrity, FTS index sync, orphaned nodes, lifecycle/session fragmentation, config validation, context pressure. |
+
+### Operator slash commands
+
+If `LCM_ENABLE_SLASH_COMMAND=true`, trusted operator contexts can use `/lcm` slash commands for diagnostics and maintenance:
+
+- `/lcm doctor repair` — read-only SQLite/FTS diagnostics for message and summary search indexes. Reports whether `messages_fts` or `nodes_fts` need repair without rebuilding anything.
+- `/lcm doctor repair apply` — backup-first SQLite/FTS repair. Creates a timestamped database backup, then rebuilds/repairs the message and summary FTS indexes without deleting source `messages` or `summary_nodes` rows.
+- `/lcm doctor source` — read-only source-lineage scan. Reports legacy `NULL`, blank, or whitespace-only message sources that are treated as `unknown` for backward-compatible retrieval.
+- `/lcm doctor source apply` — backup-first source-lineage normalization. Creates a timestamped database backup, then rewrites only legacy blank-source message rows to explicit `unknown`. The operation is idempotent and does not delete rows.
 
 ### Retrieval contract: `session_scope` × `source`
 
-`hermes-lcm` treats `session_scope` and `source` as independent filters:
+`hermes-lcm` retrieval tools are current-session tools. `session_scope` is kept for schema compatibility and currently accepts only `current`; unsupported values are ignored and reported in the tool result. Use Hermes `session_search` for earlier separate sessions or broad cross-session recall.
 
-- **`session_scope`** decides which sessions are eligible
-- **`source`** decides which content inside those eligible sessions is allowed to match
+Within that current session, `source` decides which content is allowed to match.
 
 That contract applies across:
 
@@ -290,15 +367,11 @@ That contract applies across:
 
 - `current` + no `source` → all raw rows in the current session
 - `current` + `source='discord'` → only current-session raw rows with source `discord`
-- `all` + no `source` → all raw rows across sessions
-- `all` + `source='discord'` → all raw rows across sessions with source `discord`
 
 #### DAG summaries
 
 - `current` + no `source` → all summaries eligible in the current session
 - `current` + `source='discord'` → only current-session summaries whose descendant raw-message lineage includes `discord`
-- `all` + no `source` → all eligible summaries across sessions
-- `all` + `source='discord'` → only summaries across sessions whose descendant raw-message lineage includes `discord`
 
 Mixed-source nodes may match more than one `source` filter if their descendant lineage is mixed. Filtering is based on actual descendant lineage, not on whether the surrounding session happens to contain some message from that source.
 
@@ -325,7 +398,7 @@ When both recall paths are available to the model:
 
 - prefer **LCM tools** for recall inside the active/current conversation, especially when the relevant turns were compacted into summary nodes
 - prefer **`session_search`** when the user is asking about an earlier separate conversation, prior work from another session, or broad cross-session history
-- if you explicitly want cross-session hits from the LCM store itself, use `lcm_grep(session_scope='all')` deliberately rather than treating it as the default recall path
+- if a caller sends an unsupported `session_scope`, `lcm_grep` stays on the current session and reports the ignored value in its response
 
 That split is intentional:
 
@@ -340,12 +413,17 @@ When Hermes host support for plugin slash commands is available, `hermes-lcm` ca
 This surface is **disabled by default** and requires `LCM_ENABLE_SLASH_COMMAND=1` (or `true/yes/on`) before registration.
 
 - `/lcm` or `/lcm status` — current session/runtime status
-- `/lcm doctor` — SQLite + FTS health checks and store/node totals
+- `/lcm doctor` — SQLite + FTS health checks, store/node totals, and read-only lifecycle/session fragmentation diagnostics
 - `/lcm doctor clean` — best-effort read-only scan for obvious junk/noise sessions matched from stored session keys
 - `/lcm doctor clean apply` — backup-first cleanup for safe pattern-matched junk/noise session candidates
+- `/lcm doctor repair` — read-only SQLite/FTS diagnostics for message and summary search indexes
+- `/lcm doctor repair apply` — backup-first SQLite/FTS repair for message and summary search indexes
+- `/lcm doctor source` — read-only scan for legacy blank-source message rows
+- `/lcm doctor source apply` — backup-first normalization of legacy blank-source message rows to explicit `unknown`
+- `/lcm doctor retention` — read-only retention analysis for stored session footprint and age
 - `/lcm backup` — create a timestamped SQLite backup before any future cleanup workflow
 
-The cleanup path stays intentionally narrow and backup-first; broader retention/prune workflows should still start with diagnostics before any apply/delete step.
+The cleanup and source-normalization apply paths stay intentionally narrow and backup-first; broader retention/prune workflows should still start with diagnostics before any apply/delete step.
 
 ## How It Works
 
