@@ -4,13 +4,18 @@ Implements the ContextEngine ABC. Replaces the built-in ContextCompressor
 with a DAG-based summarization system that preserves every message.
 """
 
+import inspect
 import json
 import logging
 import os
 import re
+import sqlite3
+import subprocess
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from agent.context_engine import ContextEngine
 
@@ -44,6 +49,7 @@ logger = logging.getLogger(__name__)
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent
 _PLUGIN_METADATA: dict[str, str] | None = None
+_SESSION_END_BUSY_TIMEOUT_MS = 50
 
 
 def _strip_metadata_scalar(value: str) -> str:
@@ -71,6 +77,85 @@ def _plugin_metadata() -> dict[str, str]:
 
     _PLUGIN_METADATA = metadata
     return dict(metadata)
+
+
+def _git_runtime_identity(root: Path) -> dict[str, Any]:
+    """Best-effort git identity for source checkouts.
+
+    Packaged installs may not have a `.git` directory. In that case the fields
+    stay empty instead of turning status/doctor into a git dependency.
+    """
+
+    if not (root / ".git").exists():
+        return {
+            "plugin_git_commit": "",
+            "plugin_git_branch": "",
+            "plugin_git_dirty": None,
+            "plugin_git_remote": "",
+        }
+
+    def _git(*args: str) -> str | None:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(root), *args],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=1,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug("LCM git identity probe failed at %s: %s", root, exc)
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip()
+
+    dirty_output = _git("status", "--porcelain")
+    return {
+        "plugin_git_commit": _git("rev-parse", "HEAD") or "",
+        "plugin_git_branch": _git("rev-parse", "--abbrev-ref", "HEAD") or "",
+        "plugin_git_dirty": None if dirty_output is None else bool(dirty_output),
+        "plugin_git_remote": _git("config", "--get", "remote.origin.url") or "",
+    }
+
+
+def _is_sqlite_locked_error(exc: BaseException) -> bool:
+    """Return True when an exception chain represents SQLite lock contention."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).lower()
+        if isinstance(current, sqlite3.Error) and "locked" in message:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _sqlite_busy_timeout_ms(conn: sqlite3.Connection) -> int:
+    row = conn.execute("PRAGMA busy_timeout").fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+@contextmanager
+def _temporary_sqlite_busy_timeout(
+    connections: List[sqlite3.Connection | None],
+    timeout_ms: int,
+) -> Iterator[None]:
+    """Temporarily bound SQLite lock waits for gateway-critical paths."""
+    bounded_timeout = max(0, int(timeout_ms))
+    originals: list[tuple[sqlite3.Connection, int]] = []
+    for conn in connections:
+        if conn is None:
+            continue
+        original = _sqlite_busy_timeout_ms(conn)
+        conn.execute(f"PRAGMA busy_timeout={bounded_timeout}")
+        originals.append((conn, original))
+    try:
+        yield
+    finally:
+        for conn, original in reversed(originals):
+            conn.execute(f"PRAGMA busy_timeout={original}")
 
 
 _SYNTHETIC_ASSISTANT_NOISE = {
@@ -208,6 +293,10 @@ class LCMEngine(ContextEngine):
         self._pending_reset_session_id: str = ""
         self._pending_reset_conversation_id: str = ""
         self._pending_reset_frontier_store_id: int = 0
+        self._thread_context = threading.local()
+        self._auxiliary_session_ids: set[str] = set()
+        self._auxiliary_lineage_session_ids: set[str] = set()
+        self._auxiliary_session_lock = threading.RLock()
 
     @property
     def name(self) -> str:
@@ -216,6 +305,8 @@ class LCMEngine(ContextEngine):
     # -- ContextEngine required methods ------------------------------------
 
     def update_from_response(self, usage: Dict[str, Any]) -> None:
+        if self._thread_context_stateless():
+            return
         self.last_prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
         self.last_completion_tokens = int(usage.get("completion_tokens", 0) or 0)
         self.last_total_tokens = int(usage.get("total_tokens", 0) or 0)
@@ -237,7 +328,7 @@ class LCMEngine(ContextEngine):
         return self.last_cache_read_tokens / self.last_prompt_tokens
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
-        if self._session_ignored or self._session_stateless:
+        if self._session_ignored or self._session_stateless or self._thread_context_stateless():
             return False
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         if self._should_force_overflow_recovery(observed_tokens=tokens):
@@ -248,7 +339,7 @@ class LCMEngine(ContextEngine):
 
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
-        if self._session_ignored or self._session_stateless:
+        if self._session_ignored or self._session_stateless or self._thread_context_stateless():
             return False
         if self._session_id and messages:
             try:
@@ -392,11 +483,11 @@ class LCMEngine(ContextEngine):
         if not messages:
             return messages
 
-        if self._session_ignored or self._session_stateless:
+        if self._session_ignored or self._session_stateless or self._thread_context_stateless():
             logger.debug(
                 "LCM compress bypassed for %s session %s",
-                "ignored" if self._session_ignored else "stateless",
-                self._session_id or "(unknown)",
+                "auxiliary" if self._thread_context_stateless() else "ignored" if self._session_ignored else "stateless",
+                self._thread_context_session_id() or self._session_id or "(unknown)",
             )
             return messages
 
@@ -595,6 +686,317 @@ class LCMEngine(ContextEngine):
             self._session_id,
             self._last_compacted_store_id,
         )
+
+    def _thread_context_auxiliary_stack(self) -> list[str]:
+        stack = getattr(self._thread_context, "auxiliary_session_stack", None)
+        if stack is None:
+            current = str(getattr(self._thread_context, "current_auxiliary_session_id", "") or "")
+            stack = [current] if current else []
+            self._thread_context.auxiliary_session_stack = stack
+        return stack
+
+    def _sync_thread_context_current_auxiliary(self) -> list[str]:
+        stack = self._thread_context_auxiliary_stack()
+        active_ids = self._active_auxiliary_session_ids()
+        stack[:] = [session_id for session_id in stack if session_id in active_ids]
+        self._thread_context.current_auxiliary_session_id = stack[-1] if stack else ""
+        return stack
+
+    def _thread_context_session_id(self) -> str:
+        stack = self._sync_thread_context_current_auxiliary()
+        stack_session_id = self._in_process_auxiliary_session_id_from_stack()
+        if stack_session_id:
+            return stack_session_id
+        if stack:
+            return stack[-1]
+        return ""
+
+    def _thread_context_has_auxiliary_session(self, session_id: str) -> bool:
+        with self._auxiliary_session_lock:
+            return session_id in self._auxiliary_session_ids
+
+    def _active_auxiliary_session_ids(self) -> set[str]:
+        with self._auxiliary_session_lock:
+            return set(self._auxiliary_session_ids)
+
+    def _known_auxiliary_lineage_session_ids(self) -> set[str]:
+        with self._auxiliary_session_lock:
+            return set(self._auxiliary_lineage_session_ids)
+
+    def _has_auxiliary_lineage_session(self, session_id: str) -> bool:
+        with self._auxiliary_session_lock:
+            return session_id in self._auxiliary_lineage_session_ids
+
+    def _thread_context_stateless(self) -> bool:
+        return bool(self._thread_context_session_id())
+
+    def _register_auxiliary_session(self, session_id: str) -> None:
+        with self._auxiliary_session_lock:
+            self._auxiliary_session_ids.add(session_id)
+            self._auxiliary_lineage_session_ids.add(session_id)
+
+    def _deactivate_auxiliary_session(self, session_id: str) -> None:
+        if not session_id:
+            return
+        with self._auxiliary_session_lock:
+            self._auxiliary_session_ids.discard(session_id)
+
+    def _mark_thread_context_stateless(self, session_id: str) -> None:
+        self._register_auxiliary_session(session_id)
+        stack = self._thread_context_auxiliary_stack()
+        stack[:] = [existing for existing in stack if existing != session_id]
+        stack.append(session_id)
+        self._thread_context.current_auxiliary_session_id = session_id
+
+    def _clear_thread_context_stateless(self, session_id: str = "") -> None:
+        stack = self._thread_context_auxiliary_stack()
+        if session_id:
+            stack[:] = [existing for existing in stack if existing != session_id]
+        else:
+            stack.clear()
+        self._sync_thread_context_current_auxiliary()
+
+    def _handoff_auxiliary_session(self, old_session_id: str, new_session_id: str) -> None:
+        with self._auxiliary_session_lock:
+            if old_session_id:
+                self._auxiliary_session_ids.discard(old_session_id)
+                self._auxiliary_lineage_session_ids.add(old_session_id)
+            if new_session_id:
+                self._auxiliary_session_ids.add(new_session_id)
+                self._auxiliary_lineage_session_ids.add(new_session_id)
+        stack = self._thread_context_auxiliary_stack()
+        had_thread_marker = old_session_id in stack or new_session_id in stack
+        stack[:] = [
+            existing
+            for existing in stack
+            if existing not in {old_session_id, new_session_id}
+        ]
+        if had_thread_marker and new_session_id:
+            stack.append(new_session_id)
+        self._sync_thread_context_current_auxiliary()
+
+    def _unmark_thread_context_auxiliary_session(self, session_id: str) -> None:
+        with self._auxiliary_session_lock:
+            self._auxiliary_session_ids.discard(session_id)
+        self._clear_thread_context_stateless(session_id)
+
+    def _state_db_path(self, kwargs: Dict[str, Any] | None = None) -> Path:
+        kwargs = kwargs or {}
+        hermes_home = str(kwargs.get("hermes_home") or self._hermes_home or "")
+        if hermes_home:
+            return Path(hermes_home).expanduser() / "state.db"
+        return Path(self._store.db_path).parent / "state.db"
+
+    def _caller_is_auxiliary_agent_frame(self, caller_self: Any) -> bool:
+        if caller_self is None:
+            return False
+        if getattr(caller_self, "_subagent_id", None):
+            return True
+        if getattr(caller_self, "_parent_subagent_id", None):
+            return True
+        try:
+            if int(getattr(caller_self, "_delegate_depth", 0) or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+        memory_origin = str(getattr(caller_self, "_memory_write_origin", "") or "")
+        memory_context = str(getattr(caller_self, "_memory_write_context", "") or "")
+        if memory_origin == "background_review" or memory_context == "background_review":
+            return True
+        log_prefix = str(getattr(caller_self, "log_prefix", "") or "").strip()
+        if log_prefix.startswith("[subagent-"):
+            return True
+        enabled_toolsets = getattr(caller_self, "enabled_toolsets", None)
+        if enabled_toolsets is not None:
+            try:
+                toolsets = {str(toolset) for toolset in enabled_toolsets}
+            except TypeError:
+                toolsets = set()
+            if toolsets and toolsets <= {"memory", "skills"}:
+                return True
+        if getattr(caller_self, "ephemeral_system_prompt", None) and log_prefix.startswith("[subagent-"):
+            return True
+        return False
+
+    def _in_process_parent_session_id(
+        self,
+        kwargs: Dict[str, Any],
+        session_id: str = "",
+        include_explicit: bool = True,
+    ) -> str:
+        explicit = str(kwargs.get("parent_session_id") or "")
+        if include_explicit and explicit:
+            return explicit
+        target_session_id = str(session_id or kwargs.get("session_id") or "")
+        frame = inspect.currentframe()
+        try:
+            frame = frame.f_back if frame is not None else None
+            for _ in range(32):
+                if frame is None:
+                    return ""
+                caller_self = frame.f_locals.get("self")
+                if not self._caller_is_auxiliary_agent_frame(caller_self):
+                    frame = frame.f_back
+                    continue
+                parent = str(getattr(caller_self, "_parent_session_id", "") or "")
+                caller_session = str(getattr(caller_self, "session_id", "") or "")
+                if parent and caller_session and (
+                    not target_session_id or caller_session == target_session_id
+                ):
+                    return parent
+                frame = frame.f_back
+        finally:
+            del frame
+        return ""
+
+    def _in_process_auxiliary_session_id_from_stack(self) -> str:
+        active_ids = self._active_auxiliary_session_ids()
+        lineage_ids = self._known_auxiliary_lineage_session_ids()
+        if not active_ids and not lineage_ids and not self._session_id:
+            return ""
+        frame = inspect.currentframe()
+        try:
+            frame = frame.f_back if frame is not None else None
+            for _ in range(32):
+                if frame is None:
+                    return ""
+                caller_self = frame.f_locals.get("self")
+                if not self._caller_is_auxiliary_agent_frame(caller_self):
+                    frame = frame.f_back
+                    continue
+                session_id = str(getattr(caller_self, "session_id", "") or "")
+                parent_id = str(getattr(caller_self, "_parent_session_id", "") or "")
+                if session_id and parent_id and (
+                    session_id in active_ids
+                    or session_id in lineage_ids
+                    or parent_id == self._session_id
+                    or parent_id in lineage_ids
+                ):
+                    return session_id
+                frame = frame.f_back
+        finally:
+            del frame
+        return ""
+
+    def _is_live_auxiliary_child_session(
+        self,
+        session_id: str,
+        parent_session_id: str,
+        kwargs: Dict[str, Any],
+    ) -> bool:
+        """Return True when a same-process child agent should not rebind LCM.
+
+        Detect Hermes auxiliary/background child sessions without treating real
+        foreground branches as stateless. In-process auxiliary agent frames are
+        trusted even when this engine is fresh and has no bound foreground yet.
+        Explicit parent metadata by itself is not enough, because legitimate
+        foreground branches can also carry parent ids before their state.db row
+        is visible to the plugin.
+        """
+        if not session_id or session_id == parent_session_id:
+            return False
+        known_auxiliary_ids = self._known_auxiliary_lineage_session_ids()
+        explicit_parent_id = str(kwargs.get("parent_session_id") or "")
+        in_process_parent_id = self._in_process_parent_session_id(
+            kwargs,
+            session_id,
+            include_explicit=False,
+        )
+        if in_process_parent_id:
+            if not parent_session_id or in_process_parent_id == parent_session_id:
+                return True
+            if in_process_parent_id in known_auxiliary_ids:
+                return True
+        if explicit_parent_id:
+            if self._thread_context_has_auxiliary_session(explicit_parent_id):
+                return True
+            if explicit_parent_id in known_auxiliary_ids and explicit_parent_id != self._session_id:
+                return True
+            return False
+        if not parent_session_id:
+            return False
+
+        path = self._state_db_path(kwargs)
+        if not path.exists():
+            return False
+        try:
+            uri = path.resolve().as_uri() + "?mode=ro"
+            conn = sqlite3.connect(uri, uri=True)
+            try:
+                row = conn.execute(
+                    """
+                    SELECT
+                        child.parent_session_id,
+                        child.started_at,
+                        child.ended_at,
+                        parent.id,
+                        parent.ended_at
+                    FROM sessions AS child
+                    LEFT JOIN sessions AS parent
+                        ON parent.id = child.parent_session_id
+                    WHERE child.id = ?
+                    LIMIT 1
+                    """,
+                    (session_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+        except Exception as exc:  # pragma: no cover - defensive against host DB drift
+            logger.debug("LCM auxiliary child session probe failed: %s", exc)
+            return False
+        if not row:
+            return False
+        child_parent_id, child_started_at, child_ended_at, actual_parent_id, parent_ended_at = row
+        if child_ended_at is not None or actual_parent_id is None:
+            return False
+
+        active_auxiliary_ids = self._active_auxiliary_session_ids()
+        known_auxiliary_ids = self._known_auxiliary_lineage_session_ids()
+        if child_parent_id in active_auxiliary_ids:
+            return True
+        if child_parent_id in known_auxiliary_ids and child_parent_id != self._session_id:
+            return True
+        if child_parent_id != parent_session_id:
+            return self._session_has_auxiliary_ancestor(
+                str(child_parent_id or ""),
+                known_auxiliary_ids | active_auxiliary_ids,
+                path,
+            )
+        return False
+
+    def _session_has_auxiliary_ancestor(
+        self,
+        session_id: str,
+        auxiliary_lineage_ids: set[str],
+        state_db_path: Path,
+    ) -> bool:
+        if not session_id or not auxiliary_lineage_ids or not state_db_path.exists():
+            return False
+        visited: set[str] = set()
+        current = session_id
+        try:
+            uri = state_db_path.resolve().as_uri() + "?mode=ro"
+            conn = sqlite3.connect(uri, uri=True)
+            try:
+                for _ in range(32):
+                    if not current or current in visited:
+                        return False
+                    if current in auxiliary_lineage_ids:
+                        return True
+                    visited.add(current)
+                    row = conn.execute(
+                        "SELECT parent_session_id FROM sessions WHERE id = ? LIMIT 1",
+                        (current,),
+                    ).fetchone()
+                    if not row:
+                        return False
+                    current = str(row[0] or "")
+            finally:
+                conn.close()
+        except Exception as exc:  # pragma: no cover - defensive against host DB drift
+            logger.debug("LCM auxiliary ancestor probe failed: %s", exc)
+            return False
+        return False
 
     def _clear_pending_reset_boundary(self) -> None:
         self._pending_reset_session_id = ""
@@ -829,11 +1231,33 @@ class LCMEngine(ContextEngine):
     def on_session_start(self, session_id: str, **kwargs) -> None:
         boundary_reason = str(kwargs.get("boundary_reason") or "")
         old_session_id = str(kwargs.get("old_session_id") or "")
+        previous_session_id = self._session_id
         if boundary_reason == "compression" and old_session_id and old_session_id != session_id:
+            if (
+                self._has_auxiliary_lineage_session(old_session_id)
+                and old_session_id != self._session_id
+            ):
+                self._handoff_auxiliary_session(old_session_id, session_id)
+                logger.info(
+                    "LCM auxiliary session %s compressed to %s — keeping boundary stateless",
+                    old_session_id,
+                    session_id,
+                )
+                return
+            self._clear_thread_context_stateless()
             self._continue_compression_boundary(session_id, old_session_id, kwargs)
             return
 
-        previous_session_id = self._session_id
+        if self._is_live_auxiliary_child_session(session_id, previous_session_id, kwargs):
+            self._register_auxiliary_session(session_id)
+            logger.info(
+                "LCM session %s is a live child of bound session %s — treating it as auxiliary/stateless",
+                session_id,
+                previous_session_id,
+            )
+            return
+        self._deactivate_auxiliary_session(session_id)
+        self._clear_thread_context_stateless()
         if previous_session_id and previous_session_id != session_id:
             self._finalize_pending_reset_boundary(previous_session_id)
             self._reset_session_scoped_runtime_state()
@@ -851,13 +1275,59 @@ class LCMEngine(ContextEngine):
         self._log_session_filter_diagnostics()
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
-        # Ensure all messages are persisted
-        self._ingest_messages(messages)
-        self._lifecycle.finalize_session(
-            self._conversation_id,
-            session_id,
-            frontier_store_id=self._last_compacted_store_id,
-        )
+        if self._has_auxiliary_lineage_session(session_id) and session_id != self._session_id:
+            current_thread_session_id = self._thread_context_session_id()
+            with self._auxiliary_session_lock:
+                self._auxiliary_session_ids.discard(session_id)
+            if current_thread_session_id == session_id:
+                self._clear_thread_context_stateless(session_id)
+            return
+        try:
+            with _temporary_sqlite_busy_timeout(
+                [
+                    getattr(self._store, "_conn", None),
+                    getattr(self._lifecycle, "_conn", None),
+                ],
+                _SESSION_END_BUSY_TIMEOUT_MS,
+            ):
+                try:
+                    # Best-effort final flush. Keep this path bounded because
+                    # host gateways call session-end hooks from lifecycle paths
+                    # that must not wait through SQLite's normal busy timeout.
+                    self._ingest_messages(messages)
+                except Exception as exc:
+                    if _is_sqlite_locked_error(exc):
+                        logger.warning(
+                            "LCM session-end raw-message ingest skipped due to SQLite lock after short wait; "
+                            "final messages may be absent from the plugin-local store: %s",
+                            exc,
+                        )
+                        return
+                    raise
+
+                try:
+                    self._lifecycle.finalize_session(
+                        self._conversation_id,
+                        session_id,
+                        frontier_store_id=self._last_compacted_store_id,
+                    )
+                except Exception as exc:
+                    if _is_sqlite_locked_error(exc):
+                        logger.warning(
+                            "LCM session-end lifecycle finalization skipped due to SQLite lock after short wait; "
+                            "raw messages were ingested but lifecycle state may be finalized later: %s",
+                            exc,
+                        )
+                        return
+                    raise
+        except Exception as exc:
+            if _is_sqlite_locked_error(exc):
+                logger.warning(
+                    "LCM session-end ingest/finalize skipped due to SQLite lock before bounded flush: %s",
+                    exc,
+                )
+                return
+            raise
 
     def on_session_reset(self) -> None:
         self._pending_reset_session_id = self._session_id
@@ -971,7 +1441,9 @@ class LCMEngine(ContextEngine):
         # Ingest live messages if passed (enables current-turn search)
         messages = kwargs.get("messages")
 
-        if messages and self._session_id and not (self._session_ignored or self._session_stateless):
+        if messages and self._session_id and not (
+            self._session_ignored or self._session_stateless or self._thread_context_stateless()
+        ):
             try:
                 self._ingest_messages(messages)
             except Exception as e:
@@ -1000,6 +1472,7 @@ class LCMEngine(ContextEngine):
     def get_runtime_identity(self) -> Dict[str, Any]:
         """Return operator-facing identity for the loaded LCM runtime."""
         metadata = _plugin_metadata()
+        git_identity = _git_runtime_identity(_PLUGIN_ROOT)
         lifecycle_state = None
         lifecycle_error = ""
         if self._conversation_id:
@@ -1024,6 +1497,7 @@ class LCMEngine(ContextEngine):
             "lifecycle_current_session_id": "",
             "lifecycle_last_finalized_session_id": "",
         }
+        identity.update(git_identity)
         if lifecycle_state is not None:
             identity.update({
                 "lifecycle_current_session_id": lifecycle_state.current_session_id or "",
@@ -1104,6 +1578,13 @@ class LCMEngine(ContextEngine):
                      base_url: str = "", api_key: str = "",
                      provider: str = "",
                      api_mode: str = "") -> None:
+        parent_session_id = self._in_process_parent_session_id({})
+        if parent_session_id:
+            logger.debug(
+                "LCM model update ignored for auxiliary child of %s",
+                parent_session_id,
+            )
+            return
         self.context_length = context_length
         self.threshold_tokens = int(context_length * self._config.context_threshold)
 
