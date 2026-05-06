@@ -344,6 +344,7 @@ class TestEngineABC:
         assert "lcm_grep" in names
         assert "lcm_describe" in names
         assert "lcm_expand" in names
+        assert "lcm_load_session" in names
         assert "lcm_status" in names
         assert "lcm_doctor" in names
         assert "lcm_expand_query" in names
@@ -351,14 +352,33 @@ class TestEngineABC:
         grep_schema = next(s for s in schemas if s["name"] == "lcm_grep")
         grep_props = grep_schema["parameters"]["properties"]
         assert "session_scope" in grep_props
-        assert grep_props["session_scope"]["enum"] == ["current"]
+        assert grep_props["session_scope"]["enum"] == ["current", "all", "session"]
+        assert "session_id" in grep_props
+        assert "session_scope='session'" in grep_props["session_id"]["description"]
+        # role/time_from/time_to filters are intentionally absent in this
+        # version; they need to be pushed into the search layer before being
+        # exposed again. See follow-up issue tracking that work.
+        assert "role" not in grep_props
+        assert "time_from" not in grep_props
+        assert "time_to" not in grep_props
         assert "source" in grep_props
         assert "descendant source lineage" in grep_props["source"]["description"]
         assert "unknown" in grep_props["source"]["description"]
-        assert "current session" in grep_schema["description"].lower()
+        # The default scope still steers callers to the active session.
+        description_lower = grep_schema["description"].lower()
+        assert (
+            "current-session" in description_lower
+            or "current session" in description_lower
+            or "active session" in description_lower
+        )
         assert "session_search" in grep_schema["description"]
-        assert "session_scope='all'" not in grep_schema["description"]
-        assert "session_search" in grep_props["session_scope"]["description"]
+        # The schema now documents the broader scopes — assert by enumerating them in the
+        # session_scope description rather than enforcing the legacy current-only wording.
+        scope_description = grep_props["session_scope"]["description"]
+        assert "all" in scope_description and "session" in scope_description and "current" in scope_description
+        assert "session_search" in scope_description
+        # Cross-session search is positioned as plugin-local archive recovery, not memory.
+        assert "archive" in grep_schema["description"].lower() or "plugin-local" in grep_schema["description"].lower()
 
         describe_schema = next(s for s in schemas if s["name"] == "lcm_describe")
         expand_schema = next(s for s in schemas if s["name"] == "lcm_expand")
@@ -366,26 +386,48 @@ class TestEngineABC:
 
         assert "current session" in describe_schema["description"].lower()
         assert "session_search" in describe_schema["description"]
-        assert "current session" in expand_schema["description"].lower()
+        # lcm_expand picked up a third mode (store_id); its description must surface that.
+        assert "store_id" in expand_schema["description"]
         assert "session_search" in expand_schema["description"]
         expand_props = expand_schema["parameters"]["properties"]
         assert "source_offset" in expand_props
         assert "source_limit" in expand_props
         assert "content_offset" in expand_props
+        assert "store_id" in expand_props
+        assert "across sessions" in expand_props["store_id"]["description"].lower() or "cross-session" in expand_props["store_id"]["description"].lower()
         assert "pagination" in expand_props["source_offset"]["description"].lower()
+        load_schema = next(s for s in schemas if s["name"] == "lcm_load_session")
+        load_props = load_schema["parameters"]["properties"]
+        assert load_schema["parameters"]["required"] == ["session_id"]
+        assert "ordered raw-message transcript" in load_schema["description"]
+        assert "after_store_id" in load_props
+        assert "max_content_chars" in load_props
+        assert "roles" in load_props
+        assert "time_from" in load_props
+        assert "time_to" in load_props
         assert "current session" in expand_query_schema["description"].lower()
         assert "session_search" in expand_query_schema["description"]
         expand_query_props = expand_query_schema["parameters"]["properties"]
         assert "context_max_tokens" in expand_query_props
         assert "fresh context budget" in expand_query_props["context_max_tokens"]["description"]
 
-    def test_readme_matches_current_session_retrieval_contract(self):
+    def test_readme_documents_session_scope_contract(self):
         readme = Path(__file__).resolve().parents[1].joinpath("README.md").read_text()
-        assert "session_scope='all'" not in readme
-        assert "session_scope=\"all\"" not in readme
+        # cross-session opt-in is now documented as bounded archive recovery
+        assert "session_scope='all'" in readme
+        assert "session_scope='session'" in readme
         assert "current-session recall" in readme
         assert "session_search" in readme
+        # The reframed positioning steers callers away from a memory-system
+        # reading and toward bounded archive recovery over rows already in lcm.db.
+        assert "archive" in readme.lower() or "externally backfilled" in readme.lower()
+        # No implied importer language: anchor the use case on rows already in
+        # lcm.db, not on an official OpenClaw/lossless-claw importer.
+        assert "imported from OpenClaw" not in readme
+        assert "imported from lossless-claw" not in readme
         assert "Lossless raw recovery contract" in readme
+        assert "lcm_load_session" in readme
+        assert "after_store_id" in readme
         assert "source_offset" in readme
         assert "content_offset" in readme
         assert "LCM_EXPANSION_CONTEXT_TOKENS" in readme
@@ -468,6 +510,335 @@ class TestEngineABC:
         assert engine._ingest_cursor == 0
         assert engine._context_probed is False
         assert engine._context_probe_persistable is False
+
+    def test_existing_session_restart_reconciles_cursor_before_ingest(self, tmp_path):
+        db_path = tmp_path / "restart-reconcile.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "restart-session",
+            platform="cli",
+            conversation_id="restart-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": "question before restart"},
+            {"role": "assistant", "content": "answer before restart"},
+        ]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._lifecycle.advance_frontier(
+            "restart-conversation",
+            "restart-session",
+            before_restart._store.get_session_count("restart-session"),
+        )
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "restart-session",
+            platform="cli",
+            conversation_id="restart-conversation",
+            context_length=200000,
+        )
+        active_context = persisted_messages + [
+            {"role": "assistant", "content": "calling terminal", "tool_calls": [{"id": "call_1", "type": "function"}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "terminal output after restart"},
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages("restart-session")
+        assert [row["role"] for row in rows] == [
+            "system",
+            "user",
+            "assistant",
+            "assistant",
+            "tool",
+        ]
+        assert rows[-1]["content"] == "terminal output after restart"
+        assert rows[-1]["tool_call_id"] == "call_1"
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_compacted_session_restart_skips_synthetic_context_but_persists_new_tool(self, tmp_path):
+        db_path = tmp_path / "restart-compacted.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "compacted-session",
+            platform="cli",
+            conversation_id="compacted-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": "fresh user tail"},
+            {"role": "assistant", "content": "fresh assistant tail"},
+        ]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "compacted-session",
+            platform="cli",
+            conversation_id="compacted-conversation",
+            context_length=200000,
+        )
+        active_context = [
+            {
+                "role": "system",
+                "content": "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+            },
+            {
+                "role": "assistant",
+                "content": "[Recent Summary (d0, node 12)]\nEarlier details.\n[Expand for details: hint-12]",
+            },
+            {"role": "user", "content": "fresh user tail"},
+            {"role": "assistant", "content": "fresh assistant tail"},
+            {"role": "assistant", "content": "calling terminal", "tool_calls": [{"id": "call_2", "type": "function"}]},
+            {"role": "tool", "tool_call_id": "call_2", "content": "tool output after compacted restart"},
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages("compacted-session")
+        assert [row["role"] for row in rows] == [
+            "system",
+            "user",
+            "assistant",
+            "assistant",
+            "tool",
+        ]
+        assert rows[-1]["content"] == "tool output after compacted restart"
+        assert rows[-1]["tool_call_id"] == "call_2"
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_large_session_restart_reconciles_beyond_short_tail_window(self, tmp_path):
+        db_path = tmp_path / "restart-large.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "large-restart-session",
+            platform="cli",
+            conversation_id="large-restart-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [{"role": "system", "content": "You are concise."}]
+        persisted_messages.extend(
+            {"role": "user", "content": f"message before restart {i}"}
+            for i in range(5000)
+        )
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "large-restart-session",
+            platform="cli",
+            conversation_id="large-restart-conversation",
+            context_length=200000,
+        )
+        active_context = persisted_messages + [
+            {"role": "assistant", "content": "calling terminal", "tool_calls": [{"id": "call_large", "type": "function"}]},
+            {"role": "tool", "tool_call_id": "call_large", "content": "large-session tool output after restart"},
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(
+            "large-restart-session",
+            limit=len(active_context) + 1,
+        )
+        assert len(rows) == len(active_context)
+        assert rows[-1]["role"] == "tool"
+        assert rows[-1]["tool_call_id"] == "call_large"
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_session_restart_does_not_skip_repeated_non_tail_messages(self, tmp_path):
+        db_path = tmp_path / "restart-repeated-non-tail.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "repeat-restart-session",
+            platform="cli",
+            conversation_id="repeat-restart-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": "repeatable request"},
+            {"role": "assistant", "content": "repeatable answer"},
+        ]
+        persisted_messages.extend(
+            {"role": "user", "content": f"tail message before restart {i}"}
+            for i in range(120)
+        )
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "repeat-restart-session",
+            platform="cli",
+            conversation_id="repeat-restart-conversation",
+            context_length=200000,
+        )
+        active_context = [
+            {
+                "role": "system",
+                "content": "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+            },
+            {"role": "user", "content": "repeatable request"},
+            {"role": "assistant", "content": "repeatable answer"},
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(
+            "repeat-restart-session",
+            limit=len(persisted_messages) + 3,
+        )
+        assert len(rows) == len(persisted_messages) + 2
+        assert rows[-2]["role"] == "user"
+        assert rows[-2]["content"] == "repeatable request"
+        assert rows[-1]["role"] == "assistant"
+        assert rows[-1]["content"] == "repeatable answer"
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_session_restart_persists_new_system_message(self, tmp_path):
+        db_path = tmp_path / "restart-new-system.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "system-restart-session",
+            platform="cli",
+            conversation_id="system-restart-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "user", "content": "tail before restart"},
+            {"role": "assistant", "content": "answer before restart"},
+        ]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "system-restart-session",
+            platform="cli",
+            conversation_id="system-restart-conversation",
+            context_length=200000,
+        )
+        active_context = [
+            {"role": "system", "content": "new policy injected after restart"},
+            {"role": "user", "content": "new user after restart"},
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(
+            "system-restart-session",
+            limit=len(persisted_messages) + 2,
+        )
+        assert len(rows) == len(persisted_messages) + 2
+        assert rows[-2]["role"] == "system"
+        assert rows[-2]["content"] == "new policy injected after restart"
+        assert rows[-1]["role"] == "user"
+        assert rows[-1]["content"] == "new user after restart"
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_session_restart_persists_new_system_message_that_mentions_lcm(self, tmp_path):
+        db_path = tmp_path / "restart-new-system-lcm-phrase.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "system-lcm-phrase-session",
+            platform="cli",
+            conversation_id="system-lcm-phrase-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "user", "content": "tail before restart"},
+            {"role": "assistant", "content": "answer before restart"},
+        ]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "system-lcm-phrase-session",
+            platform="cli",
+            conversation_id="system-lcm-phrase-conversation",
+            context_length=200000,
+        )
+        active_context = [
+            {
+                "role": "system",
+                "content": "Policy update: Lossless Context Management (LCM) must be audited during this run.",
+            },
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(
+            "system-lcm-phrase-session",
+            limit=len(persisted_messages) + 1,
+        )
+        assert len(rows) == len(persisted_messages) + 1
+        assert rows[-1]["role"] == "system"
+        assert rows[-1]["content"] == "Policy update: Lossless Context Management (LCM) must be audited during this run."
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_session_restart_skips_exact_lcm_system_scaffold(self, tmp_path):
+        db_path = tmp_path / "restart-system-scaffold.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "system-scaffold-session",
+            platform="cli",
+            conversation_id="system-scaffold-conversation",
+            context_length=200000,
+        )
+        before_restart._ingest_messages([
+            {"role": "user", "content": "tail before restart"},
+        ])
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "system-scaffold-session",
+            platform="cli",
+            conversation_id="system-scaffold-conversation",
+            context_length=200000,
+        )
+        active_context = [
+            {
+                "role": "system",
+                "content": "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+            },
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages("system-scaffold-session")
+        assert len(rows) == 1
+        assert rows[0]["content"] == "tail before restart"
+        assert after_restart._ingest_cursor == len(active_context)
 
     def test_get_status(self, engine):
         status = engine.get_status()
@@ -598,6 +969,329 @@ class TestSessionFiltering:
         assert instance._store.get_session_count("debug") == 0
         assert instance._dag.get_session_nodes("debug") == []
         assert instance.compression_count == 0
+
+
+class TestMessageFiltering:
+    def _make_engine(self, tmp_path, db_name, **config_kwargs):
+        config = LCMConfig(
+            database_path=str(tmp_path / db_name),
+            **config_kwargs,
+        )
+        engine = LCMEngine(config=config)
+        engine.on_session_start("user-123", platform="telegram", context_length=1000)
+        return engine
+
+    def test_no_patterns_means_no_filtering(self, tmp_path):
+        engine = self._make_engine(tmp_path, "lcm_msg_unset.db")
+        messages = [
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "normal text"},
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("user-123") == 3
+        assert engine._ignored_message_count == 0
+
+    def test_anchored_prefix_drops_matching_message(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_anchor.db",
+            ignore_message_patterns=["^Cronjob Response:"],
+            ignore_message_patterns_source="env",
+        )
+        messages = [
+            {"role": "user", "content": "Cronjob Response: hermie heartbeat\n(job_id: abc)"},
+            {"role": "user", "content": "can you check the database for me?"},
+            {"role": "assistant", "content": "Sure, looking now."},
+        ]
+        engine._ingest_messages(messages)
+
+        stored = engine._store.get_session_messages("user-123")
+        stored_contents = [row["content"] for row in stored]
+        assert len(stored) == 2
+        assert "Cronjob Response:" not in "\n".join(stored_contents)
+        assert "can you check the database for me?" in stored_contents
+        assert engine._ignored_message_count == 1
+
+    def test_triple_bracket_wrapper_variant_dropped(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_triple.db",
+            ignore_message_patterns=["^>>>Cronjob Response<<<:"],
+        )
+        messages = [
+            {"role": "user", "content": ">>>Cronjob Response<<<: heartbeat"},
+            {"role": "user", "content": "regular question"},
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("user-123") == 1
+        assert engine._ignored_message_count == 1
+
+    def test_inline_flag_pattern_drops_both_wrapper_variants(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_inline.db",
+            ignore_message_patterns=[r"(?is)^\s*(>>>\s*)?Cronjob Response"],
+        )
+        messages = [
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "user", "content": "  >>> Cronjob Response: heartbeat"},
+            {"role": "user", "content": "non-matching content"},
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("user-123") == 1
+        assert engine._ignored_message_count == 2
+
+    def test_active_pattern_does_not_regress_normal_messages(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_normal.db",
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        messages = [
+            {"role": "user", "content": "Can you check the database for me?"},
+            {"role": "assistant", "content": "Looking now."},
+        ]
+        engine._ingest_messages(messages)
+        stored_contents = [
+            row["content"] for row in engine._store.get_session_messages("user-123")
+        ]
+        assert stored_contents == [
+            "Can you check the database for me?",
+            "Looking now.",
+        ]
+        assert engine._ignored_message_count == 0
+
+    def test_anchored_pattern_does_not_match_multimodal_content(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_multimodal_anchored.db",
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        multimodal = {
+            "role": "user",
+            "content": [{"type": "text", "text": "Cronjob Response: heartbeat"}],
+        }
+        engine._ingest_messages([multimodal])
+        assert engine._store.get_session_count("user-123") == 1
+        assert engine._ignored_message_count == 0
+
+    def test_unanchored_pattern_matches_multimodal_content(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_multimodal_substr.db",
+            ignore_message_patterns=["Cronjob Response:"],
+        )
+        multimodal = {
+            "role": "user",
+            "content": [{"type": "text", "text": "Cronjob Response: heartbeat"}],
+        }
+        engine._ingest_messages([multimodal])
+        assert engine._store.get_session_count("user-123") == 0
+        assert engine._ignored_message_count == 1
+
+    def test_filter_is_role_agnostic(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_roles.db",
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        messages = [
+            {"role": "tool", "content": "Cronjob Response: tool-emitted"},
+            {"role": "assistant", "content": "Cronjob Response: assistant-quoted"},
+            {"role": "user", "content": "user-normal"},
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("user-123") == 1
+        assert engine._ignored_message_count == 2
+
+    def test_invalid_regex_warned_and_surviving_pattern_still_filters(self, tmp_path, caplog):
+        with caplog.at_level("WARNING", logger="hermes_lcm.message_patterns"):
+            engine = self._make_engine(
+                tmp_path, "lcm_msg_invalid.db",
+                ignore_message_patterns=["[unclosed", "^Cronjob Response:"],
+            )
+
+        assert "skipping invalid regex" in caplog.text
+        assert "[unclosed" in caplog.text
+
+        engine._ingest_messages([
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "user", "content": "normal text"},
+        ])
+        assert engine._store.get_session_count("user-123") == 1
+        assert engine._ignored_message_count == 1
+
+    def test_session_filter_and_message_filter_coexist(self, tmp_path):
+        # Session-level filter blocks all writes for a matched session,
+        # taking precedence over per-message filtering.
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_both_filters.db"),
+            ignore_session_patterns=["cron:*"],
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        engine = LCMEngine(config=config)
+        engine.on_session_start("cron_123", platform="cron", context_length=1000)
+        engine._ingest_messages([
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "user", "content": "anything"},
+        ])
+        assert engine._store.get_session_count("cron_123") == 0
+        # Counter does not increment for ignored sessions: ingest short-circuits before the message filter runs.
+        assert engine._ignored_message_count == 0
+
+        # On a normal-platform session, only the message filter applies.
+        engine.on_session_start("user-123", platform="telegram", context_length=1000)
+        engine._ingest_messages([
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "user", "content": "regular conversation"},
+        ])
+        assert engine._store.get_session_count("user-123") == 1
+        assert engine._ignored_message_count == 1
+
+    def test_status_surfaces_message_pattern_keys(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_status.db",
+            ignore_message_patterns=["^Cronjob Response:"],
+            ignore_message_patterns_source="env",
+        )
+        engine._ingest_messages([
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+        ])
+        status = engine.get_status()
+        assert status["ignore_message_patterns"] == ["^Cronjob Response:"]
+        assert status["ignore_message_patterns_source"] == "env"
+        assert status["ignored_message_count"] == 1
+        # Existing session-pattern keys are still surfaced unchanged.
+        assert status["ignore_session_patterns"] == []
+        assert status["ignore_session_patterns_source"] == "default"
+
+    def test_diagnostic_log_emits_once_per_engine(self, tmp_path, caplog):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_msg_log_once.db"),
+            ignore_message_patterns=["^Cronjob Response:"],
+            ignore_message_patterns_source="env",
+        )
+        engine = LCMEngine(config=config)
+
+        with caplog.at_level("INFO", logger="hermes_lcm.engine"):
+            engine.on_session_start("user-123", platform="telegram", context_length=1000)
+            engine.on_session_start("user-456", platform="telegram", context_length=1000)
+
+        assert caplog.text.count("LCM ignore_message_patterns from env: ^Cronjob Response:") == 1
+
+    def test_stateless_session_skips_message_filter_entirely(self, tmp_path):
+        # Stateless sessions short-circuit ingest before the message filter runs,
+        # mirroring the ignored-session contract. The counter must not increment
+        # for a stateless session even when patterns would otherwise match.
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_stateless_msg.db"),
+            stateless_session_patterns=["telegram:*"],
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        engine = LCMEngine(config=config)
+        engine.on_session_start("debug", platform="telegram", context_length=1000)
+        engine._ingest_messages([
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "user", "content": "anything"},
+        ])
+        assert engine._store.get_session_count("debug") == 0
+        assert engine._ignored_message_count == 0
+
+    def test_cursor_advances_when_filter_drops_entire_batch(self, tmp_path):
+        # When every message in a batch matches a filter pattern, _ingest_cursor
+        # must still advance to len(messages). Otherwise a second call with the
+        # same list would re-evaluate every message and double-increment the
+        # counter. Regression guard for the all-filtered early-return path.
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_cursor_all_filtered.db",
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        messages = [
+            {"role": "user", "content": "Cronjob Response: alpha"},
+            {"role": "user", "content": "Cronjob Response: beta"},
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("user-123") == 0
+        assert engine._ignored_message_count == 2
+        assert engine._ingest_cursor == len(messages)
+
+        # Second call with the same list must not re-process the messages.
+        engine._ingest_messages(messages)
+        assert engine._ignored_message_count == 2
+        assert engine._ingest_cursor == len(messages)
+
+    def test_restart_reconciliation_skips_ignored_messages_when_matching_store_tail(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_restart_tail.db"
+        config = LCMConfig(
+            database_path=str(db_path),
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "user-123",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="chat-1",
+        )
+        active_context = [
+            {"role": "user", "content": "first real message"},
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "assistant", "content": "real answer"},
+        ]
+        before_restart._ingest_messages(active_context)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "user-123",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="chat-1",
+        )
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages("user-123")
+        assert [row["content"] for row in rows] == ["first real message", "real answer"]
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_restart_reconciliation_skips_historical_ignored_rows_when_filter_enabled_later(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_restart_later_filter.db"
+        before_config = LCMConfig(database_path=str(db_path))
+
+        before_filter = LCMEngine(config=before_config)
+        before_filter.on_session_start(
+            "user-123",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="chat-1",
+        )
+        active_context = [
+            {"role": "user", "content": "first real message"},
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "assistant", "content": "real answer"},
+        ]
+        before_filter._ingest_messages(active_context)
+        before_filter._store.close()
+        before_filter._dag.close()
+        before_filter._lifecycle.close()
+
+        after_config = LCMConfig(
+            database_path=str(db_path),
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        after_filter_restart = LCMEngine(config=after_config)
+        after_filter_restart.on_session_start(
+            "user-123",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="chat-1",
+        )
+        after_filter_restart._ingest_messages(active_context)
+
+        rows = after_filter_restart._store.get_session_messages("user-123")
+        assert [row["content"] for row in rows] == [
+            "first real message",
+            "Cronjob Response: heartbeat",
+            "real answer",
+        ]
+        assert after_filter_restart._ingest_cursor == len(active_context)
 
 
 class TestEngineIngest:
@@ -1750,6 +2444,7 @@ class TestSessionRollover:
                 "expand_hint": "",
                 "earliest_at": None,
                 "latest_at": None,
+                "from_current_session": True,
             }
         ]
         assert engine._dag.get_node(pruned_node_id) is None
@@ -5240,6 +5935,19 @@ class TestEngineTools:
         result = json.loads(engine.handle_tool_call("lcm_grep", {"query": "docker"}))
         assert "results" in result
 
+    def test_handle_grep_unbound_current_session_does_not_search_all_sessions(self, tmp_path):
+        config = LCMConfig(database_path=str(tmp_path / "unbound-current-session.db"))
+        instance = LCMEngine(config=config)
+        assert instance._session_id == ""
+        instance._store.append("session-a", {"role": "user", "content": "docker from session a"})
+        instance._store.append("session-b", {"role": "user", "content": "docker from session b"})
+
+        result = json.loads(instance.handle_tool_call("lcm_grep", {"query": "docker", "limit": 10}))
+
+        assert result["session_scope"] == "current"
+        assert result["total_results"] == 0
+        assert result["results"] == []
+
     def test_handle_grep_reports_sort_mode(self, engine):
         engine._store.append(
             "test-session",
@@ -5253,7 +5961,7 @@ class TestEngineTools:
         )
         assert result["sort"] == "relevance"
 
-    def test_handle_grep_reports_unsupported_session_scope_and_stays_current(self, engine):
+    def test_handle_grep_session_scope_all_returns_cross_session_hits(self, engine):
         engine._store.append("test-session", {"role": "user", "content": "docker rollout current session"})
         engine._store.append("old-session", {"role": "user", "content": "docker rollout old session"})
 
@@ -5264,9 +5972,31 @@ class TestEngineTools:
             )
         )
 
+        assert result["session_scope"] == "all"
+        assert result["total_results"] == 2
+        session_ids = {hit["session_id"] for hit in result["results"]}
+        assert session_ids == {"test-session", "old-session"}
+        from_current_flags = {
+            hit["session_id"]: hit["from_current_session"] for hit in result["results"]
+        }
+        assert from_current_flags == {"test-session": True, "old-session": False}
+        # No ignored_session_scope key when the requested scope is now supported.
+        assert "ignored_session_scope" not in result
+
+    def test_handle_grep_truly_unknown_session_scope_stays_current_and_reports(self, engine):
+        engine._store.append("test-session", {"role": "user", "content": "docker rollout current session"})
+        engine._store.append("old-session", {"role": "user", "content": "docker rollout old session"})
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "session_scope": "everything", "limit": 10},
+            )
+        )
+
         assert result["session_scope"] == "current"
-        assert result["ignored_session_scope"] == "all"
-        assert "session_search" in result["scope_note"]
+        assert result["ignored_session_scope"] == "everything"
+        assert "current" in result["scope_note"]
         assert result["total_results"] == 1
         assert result["results"][0]["session_id"] == "test-session"
 
@@ -7859,6 +8589,522 @@ class TestEngineTools:
         fts_check = next(c for c in result["checks"] if c["check"] == "fts_index_sync")
         assert fts_check["status"] == "pass"
         assert fts_check["detail"] == "1 session FTS rows, 1 session messages"
+
+
+class TestHandleGrepCrossSession:
+    """Cross-session search via session_scope=all|session and the new filters."""
+
+    def _seed_two_sessions(self, engine):
+        engine._store.append("test-session", {"role": "user", "content": "docker plan current"})
+        engine._store.append("test-session", {"role": "assistant", "content": "docker plan current reply"})
+        engine._store.append("old-session", {"role": "user", "content": "docker plan old"}, source="discord")
+
+    def test_session_scope_all_returns_cross_session_messages(self, engine):
+        self._seed_two_sessions(engine)
+        result = json.loads(
+            engine.handle_tool_call("lcm_grep", {"query": "docker", "session_scope": "all"})
+        )
+        assert result["session_scope"] == "all"
+        sessions_seen = {hit["session_id"] for hit in result["results"]}
+        assert sessions_seen == {"test-session", "old-session"}
+        for hit in result["results"]:
+            assert "from_current_session" in hit
+            assert hit["from_current_session"] == (hit["session_id"] == "test-session")
+            assert "timestamp" in hit
+            assert hit["timestamp"] >= 0
+
+    def test_session_scope_session_restricts_to_explicit_id(self, engine):
+        self._seed_two_sessions(engine)
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "session_scope": "session", "session_id": "old-session"},
+            )
+        )
+        assert result["session_scope"] == "session"
+        assert result["session_id"] == "old-session"
+        assert result["total_results"] == 1
+        assert result["results"][0]["session_id"] == "old-session"
+        assert result["results"][0]["from_current_session"] is False
+
+    def test_session_scope_session_without_session_id_returns_error(self, engine):
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "session_scope": "session"},
+            )
+        )
+        assert "error" in result
+        assert "session_id" in result["error"]
+
+    def test_session_scope_current_with_session_id_returns_error(self, engine):
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "session_scope": "current", "session_id": "old-session"},
+            )
+        )
+        assert "error" in result
+        assert "session_id is only valid with session_scope=session" in result["error"]
+
+    def test_session_scope_all_with_session_id_returns_error(self, engine):
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "session_scope": "all", "session_id": "old-session"},
+            )
+        )
+        assert "error" in result
+
+    def test_limit_clamped_at_hard_cap(self, engine):
+        engine._store.append("test-session", {"role": "user", "content": "docker once"})
+        result = json.loads(
+            engine.handle_tool_call("lcm_grep", {"query": "docker", "limit": 5000})
+        )
+        assert result["limit"] == 200
+        assert result["limit_clamped_from"] == 5000
+
+    def test_limit_zero_returns_error(self, engine):
+        engine._store.append("test-session", {"role": "user", "content": "docker plan"})
+        result = json.loads(
+            engine.handle_tool_call("lcm_grep", {"query": "docker", "limit": 0})
+        )
+        assert "error" in result
+        assert "limit" in result["error"]
+
+    def test_limit_negative_returns_error(self, engine):
+        engine._store.append("test-session", {"role": "user", "content": "docker plan"})
+        result = json.loads(
+            engine.handle_tool_call("lcm_grep", {"query": "docker", "limit": -5})
+        )
+        assert "error" in result
+
+    def test_empty_engine_session_with_unknown_scope_does_not_leak(self, engine):
+        # Regression: unknown session_scope previously fell through to engine._session_id
+        # and returned multi-session rows when the engine was unbound. The fix in #104
+        # makes empty session_id a literal scoped filter at the data layer; the unknown-
+        # scope fallback now routes through current-session and naturally returns zero
+        # results instead of leaking. Mirrors the maintainer's repro from PR #102 review.
+        engine._session_id = ""
+        engine._store.append("session-a", {"role": "user", "content": "docker from a"})
+        engine._store.append("session-b", {"role": "user", "content": "docker from b"})
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "session_scope": "bogus", "limit": 10},
+            )
+        )
+        assert result["session_scope"] == "current"
+        assert result["ignored_session_scope"] == "bogus"
+        assert result["total_results"] == 0
+        assert result["results"] == []
+
+    def test_cross_session_scope_returns_only_message_hits(self, engine):
+        # Cross-session scope intentionally restricts to raw-message hits.
+        # Summary nodes from foreign sessions are excluded entirely (deferred
+        # until a real cross-session DAG-expansion contract exists).
+        engine._store.append("old-session", {"role": "user", "content": "docker old message"})
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="old-session",
+                depth=0,
+                summary="docker old summary",
+                token_count=5,
+                source_token_count=5,
+                source_ids=[1],
+                source_type="messages",
+                created_at=time.time(),
+            )
+        )
+        result = json.loads(
+            engine.handle_tool_call("lcm_grep", {"query": "docker", "session_scope": "all"})
+        )
+        types_seen = {hit["type"] for hit in result["results"]}
+        assert "message" in types_seen
+        assert "summary" not in types_seen
+        # No summary hits means no cross_session_expand_supported marker is needed.
+        for hit in result["results"]:
+            assert "cross_session_expand_supported" not in hit
+
+    def test_current_scope_still_returns_summary_hits(self, engine):
+        # Regression: removing cross-session summary hits must not affect
+        # current-session DAG search behavior.
+        engine._store.append("test-session", {"role": "user", "content": "docker current"})
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="docker current summary",
+                token_count=5,
+                source_token_count=5,
+                source_ids=[1],
+                source_type="messages",
+                created_at=time.time(),
+            )
+        )
+        result = json.loads(engine.handle_tool_call("lcm_grep", {"query": "docker"}))
+        types_seen = {hit["type"] for hit in result["results"]}
+        assert "summary" in types_seen
+
+    def test_source_filter_combined_with_scope_all(self, engine):
+        engine._store.append("test-session", {"role": "user", "content": "docker via cli"}, source="cli")
+        engine._store.append("old-session", {"role": "user", "content": "docker via discord"}, source="discord")
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "session_scope": "all", "source": "discord"},
+            )
+        )
+        assert result["session_scope"] == "all"
+        assert result["source"] == "discord"
+        assert result["total_results"] == 1
+        assert result["results"][0]["session_id"] == "old-session"
+        assert result["results"][0]["source"] == "discord"
+
+    def test_default_scope_preserves_historical_behavior(self, engine):
+        # Omitting session_scope must behave identically to current.
+        engine._store.append("test-session", {"role": "user", "content": "docker default"})
+        engine._store.append("old-session", {"role": "user", "content": "docker old"})
+        result = json.loads(engine.handle_tool_call("lcm_grep", {"query": "docker"}))
+        assert result["session_scope"] == "current"
+        sessions_seen = {hit["session_id"] for hit in result["results"]}
+        assert sessions_seen == {"test-session"}
+
+
+class TestHandleExpandStoreId:
+    """lcm_expand store_id mode for cross-session raw expansion."""
+
+    def test_store_id_returns_raw_message_cross_session(self, engine):
+        store_id = engine._store.append(
+            "old-session",
+            {"role": "user", "content": "cross session content body"},
+            source="cli",
+        )
+        result = json.loads(engine.handle_tool_call("lcm_expand", {"store_id": store_id}))
+        assert result["source_type"] == "raw_message"
+        assert result["store_id"] == store_id
+        assert result["session_id"] == "old-session"
+        assert result["from_current_session"] is False
+        assert result["role"] == "user"
+        assert result["source"] == "cli"
+        assert result["content"].startswith("cross session content")
+
+    def test_store_id_paging_via_content_offset(self, engine):
+        big_content = "x" * 10000
+        store_id = engine._store.append(
+            "old-session", {"role": "user", "content": big_content}
+        )
+        first = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand", {"store_id": store_id, "max_tokens": 50}
+            )
+        )
+        assert first["content_truncated"] is True
+        assert first["next_content_offset"] > 0
+        second = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand",
+                {
+                    "store_id": store_id,
+                    "max_tokens": 50,
+                    "content_offset": first["next_content_offset"],
+                },
+            )
+        )
+        assert second["content_offset"] == first["next_content_offset"]
+        assert second["content"]
+        # Combined slices should not exceed total content length.
+        assert first["content_chars"] == second["content_chars"]
+
+    def test_store_id_not_found_returns_error(self, engine):
+        result = json.loads(
+            engine.handle_tool_call("lcm_expand", {"store_id": 999_999_999})
+        )
+        assert "error" in result
+        assert "store_id" in result["error"]
+
+    def test_store_id_not_an_integer_returns_error(self, engine):
+        result = json.loads(
+            engine.handle_tool_call("lcm_expand", {"store_id": "not-an-int"})
+        )
+        assert "error" in result
+        assert "integer" in result["error"]
+
+    def test_multiple_modes_returns_error(self, engine):
+        store_id = engine._store.append(
+            "test-session", {"role": "user", "content": "x"}
+        )
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand", {"store_id": store_id, "node_id": 1}
+            )
+        )
+        assert "error" in result
+        assert "Provide only one" in result["error"]
+
+    def test_no_modes_returns_error(self, engine):
+        result = json.loads(engine.handle_tool_call("lcm_expand", {}))
+        assert "error" in result
+        assert "node_id" in result["error"] and "store_id" in result["error"]
+
+    def test_node_id_remains_session_scoped(self, engine):
+        # Node belongs to a different session — must not be expandable via node_id.
+        engine._store.append("old-session", {"role": "user", "content": "old content"})
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="old-session",
+                depth=0,
+                summary="old summary",
+                token_count=5,
+                source_token_count=5,
+                source_ids=[1],
+                source_type="messages",
+                created_at=time.time(),
+            )
+        )
+        result = json.loads(
+            engine.handle_tool_call("lcm_expand", {"node_id": node_id})
+        )
+        assert "error" in result
+        assert "current session" in result["error"].lower()
+
+    def test_store_id_cross_session_externalized_ref_surfaced_with_note(self, engine):
+        # Seed a foreign-session tool message that references an externalized
+        # payload. The ref string follows the produced-placeholder shape so
+        # extract_externalized_ref will pick it up.
+        placeholder = (
+            "[Externalized tool output: tool_call_id=call_abc; "
+            "chars=1234; bytes=5678; ref=foreign_payload_ref.json]"
+        )
+        store_id = engine._store.append(
+            "old-session",
+            {"role": "tool", "content": placeholder, "tool_call_id": "call_abc"},
+        )
+        result = json.loads(engine.handle_tool_call("lcm_expand", {"store_id": store_id}))
+        assert result["source_type"] == "raw_message"
+        assert result["from_current_session"] is False
+        assert result["externalized_ref"] == "foreign_payload_ref.json"
+        # Cross-session payload metadata is intentionally omitted; an explanatory
+        # note is surfaced so callers don't treat the bare ref as expandable.
+        assert "externalized" not in result
+        assert "externalized_note" in result
+        assert "session-scoped" in result["externalized_note"].lower()
+
+    def test_grep_then_expand_round_trip_cross_session(self, engine):
+        store_id = engine._store.append(
+            "old-session", {"role": "user", "content": "phoenix payload across session"}
+        )
+        grep_result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "phoenix", "session_scope": "all"},
+            )
+        )
+        cross_hits = [
+            hit for hit in grep_result["results"]
+            if hit["type"] == "message" and hit["session_id"] == "old-session"
+        ]
+        assert cross_hits, "cross-session grep should surface the seeded message"
+        assert cross_hits[0]["store_id"] == store_id
+
+        expand_result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand", {"store_id": cross_hits[0]["store_id"]}
+            )
+        )
+        assert expand_result["source_type"] == "raw_message"
+        assert "phoenix payload" in expand_result["content"]
+
+
+class TestHandleLoadSession:
+    """Ordered, paged raw transcript loading by explicit session_id."""
+
+    def _seed_old_session(self, engine):
+        rows = [
+            ("user", "first old-session message", "cli", 100.0),
+            ("assistant", "second old-session answer", "cli", 200.0),
+            ("tool", "third old-session tool result", "cli", 300.0),
+            ("user", "fourth old-session follow-up", "telegram", 400.0),
+        ]
+        store_ids = []
+        for role, content, source, timestamp in rows:
+            store_id = engine._store.append(
+                "old-session",
+                {"role": role, "content": content, "tool_call_id": "call_x" if role == "tool" else None},
+                source=source,
+            )
+            engine._store._conn.execute(
+                "UPDATE messages SET timestamp = ? WHERE store_id = ?",
+                (timestamp, store_id),
+            )
+            store_ids.append(store_id)
+        engine._store._conn.commit()
+        engine._store.append("test-session", {"role": "user", "content": "current session message"})
+        return store_ids
+
+    def test_load_session_returns_ordered_bounded_raw_page(self, engine):
+        store_ids = self._seed_old_session(engine)
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "old-session", "limit": 2},
+            )
+        )
+
+        assert result["session_id"] == "old-session"
+        assert result["limit"] == 2
+        assert result["total_messages"] == 4
+        assert result["returned_messages"] == 2
+        assert result["has_more"] is True
+        assert result["next_cursor"] == store_ids[1]
+        assert [item["store_id"] for item in result["messages"]] == store_ids[:2]
+        assert [item["role"] for item in result["messages"]] == ["user", "assistant"]
+        assert result["messages"][0]["content"] == "first old-session message"
+        assert result["messages"][0]["content_chars"] == len("first old-session message")
+        assert result["messages"][0]["content_truncated"] is False
+        assert result["messages"][0]["from_current_session"] is False
+        assert "snippet" not in result["messages"][0]
+
+    def test_load_session_pages_after_store_id(self, engine):
+        store_ids = self._seed_old_session(engine)
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "old-session", "after_store_id": store_ids[1], "limit": 10},
+            )
+        )
+
+        assert result["after_store_id"] == store_ids[1]
+        assert result["has_more"] is False
+        assert result["next_cursor"] is None
+        assert [item["store_id"] for item in result["messages"]] == store_ids[2:]
+
+    def test_load_session_filters_roles_and_time_range(self, engine):
+        store_ids = self._seed_old_session(engine)
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {
+                    "session_id": "old-session",
+                    "roles": ["user", "tool"],
+                    "time_from": 250.0,
+                    "time_to": 450.0,
+                    "limit": 10,
+                },
+            )
+        )
+
+        assert result["roles"] == ["user", "tool"]
+        assert result["time_from"] == 250.0
+        assert result["time_to"] == 450.0
+        assert result["total_messages"] == 2
+        assert [item["store_id"] for item in result["messages"]] == [store_ids[2], store_ids[3]]
+        assert [item["role"] for item in result["messages"]] == ["tool", "user"]
+
+    def test_load_session_bounds_large_message_content(self, engine):
+        store_id = engine._store.append(
+            "large-session",
+            {"role": "assistant", "content": "abcdef"},
+            source="cli",
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "large-session", "max_content_chars": 3},
+            )
+        )
+
+        assert result["max_content_chars"] == 3
+        assert result["messages"][0]["store_id"] == store_id
+        assert result["messages"][0]["content"] == "abc"
+        assert result["messages"][0]["content_chars"] == 6
+        assert result["messages"][0]["content_returned_chars"] == 3
+        assert result["messages"][0]["content_truncated"] is True
+        assert result["messages"][0]["next_content_offset"] == 3
+
+    def test_load_session_clamps_max_content_chars(self, engine):
+        store_id = engine._store.append(
+            "large-session",
+            {"role": "user", "content": "x" * 25_000},
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "large-session", "max_content_chars": 50_000},
+            )
+        )
+
+        assert result["max_content_chars"] == 20_000
+        assert result["max_content_chars_clamped_from"] == 50_000
+        assert result["messages"][0]["store_id"] == store_id
+        assert len(result["messages"][0]["content"]) == 20_000
+        assert result["messages"][0]["content_truncated"] is True
+
+    def test_load_session_rejects_missing_session_id_and_invalid_filters(self, engine):
+        missing = json.loads(engine.handle_tool_call("lcm_load_session", {}))
+        assert "error" in missing and "session_id" in missing["error"]
+
+        bad_roles = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "old-session", "roles": "user"},
+            )
+        )
+        assert "error" in bad_roles and "roles" in bad_roles["error"]
+
+        bad_cursor = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "old-session", "after_store_id": "not-an-id"},
+            )
+        )
+        assert "error" in bad_cursor and "after_store_id" in bad_cursor["error"]
+
+        bad_limit = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "old-session", "limit": "not-a-limit"},
+            )
+        )
+        assert "error" in bad_limit and "limit" in bad_limit["error"]
+
+        bad_max_content_chars = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "old-session", "max_content_chars": "not-a-size"},
+            )
+        )
+        assert "error" in bad_max_content_chars and "max_content_chars" in bad_max_content_chars["error"]
+
+        bad_range = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "old-session", "time_from": 5, "time_to": 4},
+            )
+        )
+        assert "error" in bad_range and "time_to" in bad_range["error"]
+
+    def test_load_session_clamps_limit_and_never_falls_back_to_current(self, engine):
+        self._seed_old_session(engine)
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "missing-session", "limit": 5000},
+            )
+        )
+
+        assert result["session_id"] == "missing-session"
+        assert result["limit"] == 200
+        assert result["limit_clamped_from"] == 5000
+        assert result["total_messages"] == 0
+        assert result["messages"] == []
+        assert result["has_more"] is False
 
 
 class TestExtractionDuringCompress:
