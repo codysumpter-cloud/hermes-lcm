@@ -69,7 +69,7 @@ claim that Hermes core has no persisted record of pre-compression history.
 
 - Hermes Agent with the pluggable context engine slot ([PR #7464](https://github.com/NousResearch/hermes-agent/pull/7464))
 - Python 3.11+
-- No required third-party runtime dependencies. `tiktoken` is used if available; otherwise LCM falls back to character-based token estimates.
+- No required third-party runtime dependencies. `tiktoken` is used if available; otherwise LCM falls back to character-based token estimates. `regex` is used if available to apply timeouts to message ignore patterns; if it is not installed, message-level regex filtering is disabled with a warning rather than running unbounded stdlib `re` matches.
 
 ## Install
 
@@ -155,7 +155,7 @@ Typical output:
 
 ```text
 Plugins (1):
-  ✓ hermes-lcm v0.8.0 (7 tools)
+  ✓ hermes-lcm v0.9.1 (7 tools)
 
 Provider Plugins:
   Context Engine: lcm
@@ -192,7 +192,7 @@ environment variables:
 | `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after manual `/new` (`-1` all, `0` none) |
 | `LCM_IGNORE_SESSION_PATTERNS` | empty | Comma-separated session globs excluded from LCM storage |
 | `LCM_STATELESS_SESSION_PATTERNS` | empty | Comma-separated session globs kept read-only |
-| `LCM_IGNORE_MESSAGE_PATTERNS` | empty | Comma-separated regex patterns; matching message content (plain text, or the normalized form for structured/multimodal content) is excluded from LCM storage |
+| `LCM_IGNORE_MESSAGE_PATTERNS` | empty | Comma-separated regex patterns; matching message content (plain text, extracted text parts for structured/multimodal content, or normalized JSON fallback when no text parts exist) is excluded from LCM storage |
 | `LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED` | `false` | Store oversized tool outputs in plugin-managed JSON files |
 | `LCM_LARGE_OUTPUT_EXTERNALIZATION_THRESHOLD_CHARS` | `12000` | Externalization threshold for tool output text |
 | `LCM_LARGE_OUTPUT_TRANSCRIPT_GC_ENABLED` | `false` | Rewrite already-externalized summarized tool rows to compact placeholders |
@@ -246,11 +246,14 @@ noise:
   so only the message content is distinctive.
 
 Message-level patterns are Python regex strings, comma-separated, compiled
-once at engine start. They run against the normalized message content (the
-same string LCM would have written to the store). Matching messages are
-skipped before storage, so new matching rows do not enter the messages table
-or FTS index. Filtering is role-agnostic by default, since cron alerts can
-be re-emitted under any role depending on the gateway.
+once at engine start. They run against plain message text. For structured
+multimodal payloads, LCM matches against concatenated text parts first, so
+anchored patterns bind to the text an operator sees. If a structured payload
+contains no text parts, matching falls back to the normalized JSON form that
+LCM would have written to the store. Matching messages are skipped before
+storage, so new matching rows do not enter the messages table or FTS index.
+Filtering is role-agnostic by default, since cron alerts can be re-emitted
+under any role depending on the gateway.
 
 Example operator config:
 
@@ -260,16 +263,13 @@ LCM_IGNORE_MESSAGE_PATTERNS=^Cronjob Response:,^>>>Cronjob Response<<<:
 
 Invalid regex entries are logged at warning level and dropped; the
 surviving patterns in the same list still take effect, so a misconfigured
-entry never crashes ingest.
+entry never crashes ingest. Pattern matching uses a 50 ms per-pattern timeout
+when the optional `regex` package is installed. If `regex` is not installed,
+LCM logs a warning and disables message-level regex filtering rather than
+running unbounded stdlib `re` matches in the ingest path.
 
-Two operator-facing limitations to know about:
+One operator-facing limitation to know about:
 
-- **Anchored patterns are best-effort against multimodal content.**
-  Structured payloads (lists of content parts) are normalized via JSON
-  serialization before matching, so a `^`-anchored pattern binds to the
-  JSON wrapper rather than to the inner text. If you expect cron alerts to
-  arrive as multimodal payloads from your gateway, use unanchored patterns
-  (for example `Cronjob Response:` instead of `^Cronjob Response:`).
 - **Compaction-window edge.** The filter runs at ingest time. When a
   matching message is part of the chunk being summarized in the same
   turn it arrived, the message's text may appear inside the resulting
@@ -280,9 +280,11 @@ Two operator-facing limitations to know about:
   store), so DAG lineage stays clean; only the serialized summary text
   can carry it. Closing this window is tracked as follow-up work.
 
-`lcm_status` surfaces `ignore_message_patterns`, `ignore_message_patterns_source`
-(`default` or `env`), and a process-lifetime `ignored_message_count` so
-operators can confirm their pattern is loaded and watch how often it fires.
+`lcm_status` surfaces the full filter contract under `session_filters`, including
+`ignore_session_patterns`, `stateless_session_patterns`, `ignore_message_patterns`,
+their `*_source` fields (`default` or `env`), the current session's `ignored` and
+`stateless` booleans, and a process-lifetime `ignored_message_count` so operators
+can confirm their patterns are loaded and watch how often message filters fire.
 The counter resets on engine restart.
 
 ### Large tool-output handling

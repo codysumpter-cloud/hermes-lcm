@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 import sqlite3
 import threading
 import time
@@ -87,6 +88,40 @@ def test_lcm_tool_status_includes_optional_cache_usage_metrics(engine):
     assert payload["runtime_identity"]["database_path_source"] == "config.database_path"
 
 
+def test_lcm_tool_status_forwards_filter_config_to_agent_surface(tmp_path, monkeypatch):
+    from hermes_lcm import message_patterns as message_patterns_mod
+
+    monkeypatch.setattr(message_patterns_mod, "_regex_engine", _FakeTimeoutRegexEngine)
+
+    config = LCMConfig(
+        database_path=str(tmp_path / "tool-status-filter-config.db"),
+        ignore_session_patterns=["cron:*"],
+        stateless_session_patterns=["debug:*"],
+        ignore_message_patterns=["^Cronjob Response:"],
+        ignore_session_patterns_source="env",
+        stateless_session_patterns_source="env",
+        ignore_message_patterns_source="env",
+    )
+    engine = LCMEngine(config=config)
+    engine.on_session_start("chat-1", platform="telegram", context_length=200000)
+    engine._ingest_messages([{"role": "user", "content": "Cronjob Response: heartbeat"}])
+
+    payload = json.loads(lcm_tools.lcm_status({}, engine=engine))
+
+    assert payload["session_filters"] == {
+        "ignored": False,
+        "stateless": False,
+        "ignore_session_patterns": ["cron:*"],
+        "ignore_session_patterns_source": "env",
+        "stateless_session_patterns": ["debug:*"],
+        "stateless_session_patterns_source": "env",
+        "ignore_message_patterns": ["^Cronjob Response:"],
+        "ignore_message_patterns_source": "env",
+        "ignored_message_count": 1,
+        "side_channel_active": False,
+    }
+
+
 def test_lcm_tool_status_reports_runtime_identity_before_session_binding(tmp_path):
     config = LCMConfig(database_path=str(tmp_path / "unbound-tool-status.db"))
     engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes-home"))
@@ -118,7 +153,7 @@ def test_get_status_exposes_runtime_identity_for_loaded_plugin_tree(tmp_path):
 
     assert identity["engine"] == "lcm"
     assert identity["plugin_name"] == "hermes-lcm"
-    assert identity["plugin_version"] == "0.8.0"
+    assert identity["plugin_version"] == "0.9.1"
     assert Path(identity["plugin_path"]) == repo_root
     assert Path(identity["module_path"]).name == "engine.py"
     assert Path(identity["database_path"]) == db_path
@@ -137,7 +172,7 @@ def test_lcm_doctor_json_includes_runtime_identity(engine):
     payload = json.loads(engine.handle_tool_call("lcm_doctor", {}))
 
     assert payload["runtime_identity"]["plugin_name"] == "hermes-lcm"
-    assert payload["runtime_identity"]["plugin_version"] == "0.8.0"
+    assert payload["runtime_identity"]["plugin_version"] == "0.9.1"
     assert "plugin_git_commit" in payload["runtime_identity"]
 
 class TestEscalationStripReasoning:
@@ -970,8 +1005,341 @@ class TestSessionFiltering:
         assert instance._dag.get_session_nodes("debug") == []
         assert instance.compression_count == 0
 
+    def test_ignored_session_does_not_rebind_foreground_view(self, tmp_path):
+        """A cron-style ignored session arriving while a foreground session is
+        bound must not steal the engine's foreground "current session" view.
+        The engine continues to rebind ``_session_id`` so cron's own compress
+        / handle_tool_call calls correctly short-circuit on
+        ``_session_ignored=True``, but ``current_session_id`` (the property
+        every LCM tool reads) keeps pointing at the foreground binding.
+        """
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_no_rebind_ignored.db"),
+            ignore_session_patterns=["cron:*"],
+        )
+        instance = LCMEngine(config=config)
+
+        instance.on_session_start(
+            "20260506_201605_75a4c6",
+            platform="telegram",
+            conversation_id="telegram-conversation",
+            context_length=200_000,
+        )
+        instance._store.append(
+            "20260506_201605_75a4c6",
+            {"role": "user", "content": "hi from telegram"},
+            token_estimate=4,
+            source="telegram",
+        )
+
+        instance.on_session_start(
+            "cron_eee06bdbb09b_20260506_210051",
+            platform="cron",
+            conversation_id="cron-conversation",
+            context_length=200_000,
+        )
+
+        # Bound state continues to follow the side channel so cron's own
+        # compress and handle_tool_call calls correctly short-circuit on
+        # _session_ignored=True. This is the pre-fix behavior and must be
+        # preserved -- without it, cron messages would ingest into the
+        # foreground store via _ingest_messages.
+        assert instance._session_id == "cron_eee06bdbb09b_20260506_210051"
+        assert instance._session_ignored is True
+
+        # Foreground view stays stable across the rebind. Tools that read
+        # current_session_id (lcm_status, lcm_grep default scope, etc.)
+        # continue to see the operator's real conversation.
+        assert instance._foreground_session_id == "20260506_201605_75a4c6"
+        assert instance.current_session_id == "20260506_201605_75a4c6"
+        assert instance.current_session_platform == "telegram"
+        assert instance.current_conversation_id == "telegram-conversation"
+
+    def test_ignored_session_compress_does_not_leak_into_foreground_store(self, tmp_path):
+        """Regression: the foreground view must not come at the cost of
+        leaking the side channel's transcript into the foreground store. With
+        the bound binding still pointing at the cron session,
+        ``_session_ignored=True`` correctly gates ingest so cron's compress
+        and should_compress_preflight calls leave the foreground row count
+        untouched.
+        """
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_no_leak_ignored.db"),
+            ignore_session_patterns=["cron:*"],
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start(
+            "telegram-foreground",
+            platform="telegram",
+            context_length=200_000,
+        )
+        instance._store.append(
+            "telegram-foreground",
+            {"role": "user", "content": "telegram-1"},
+            token_estimate=2,
+            source="telegram",
+        )
+        instance.on_session_start(
+            "cron_xxx",
+            platform="cron",
+            context_length=200_000,
+        )
+
+        cron_messages = [
+            {"role": "system", "content": "sys-cron"},
+            {"role": "user", "content": "cron-1"},
+            {"role": "assistant", "content": "cron-2"},
+            {"role": "user", "content": "cron-3"},
+        ]
+        instance.should_compress_preflight(cron_messages)
+        instance.compress(cron_messages)
+
+        assert instance._store.get_session_count("telegram-foreground") == 1
+        assert instance._store.get_session_count("cron_xxx") == 0
+
+    def test_lcm_status_stays_on_foreground_after_cron_tick(self, tmp_path):
+        """End-to-end: lcm_status must still report the Telegram session id
+        and its row counts after a cron-style ignored session has rebound the
+        engine. The bound side channel surfaces only via the diagnostic
+        ``side_channel_in_flight`` / ``bound_session_id`` keys.
+        """
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_status_after_cron.db"),
+            ignore_session_patterns=["cron:*"],
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start(
+            "20260506_201605_75a4c6",
+            platform="telegram",
+            conversation_id="telegram-conversation",
+            context_length=200_000,
+        )
+        instance._store.append(
+            "20260506_201605_75a4c6",
+            {"role": "user", "content": "telegram message"},
+            token_estimate=3,
+            source="telegram",
+        )
+
+        instance.on_session_start(
+            "cron_eee06bdbb09b_20260506_210051",
+            platform="cron",
+            conversation_id="cron-conversation",
+            context_length=200_000,
+        )
+
+        payload = json.loads(lcm_tools.lcm_status({}, engine=instance))
+
+        assert payload["session_id"] == "20260506_201605_75a4c6"
+        assert payload["store"]["messages"] == 1
+        assert payload["source_lineage"]["messages_total"] == 1
+        assert payload["runtime_identity"]["session_id"] == "20260506_201605_75a4c6"
+        assert payload["runtime_identity"]["session_platform"] == "telegram"
+        assert payload["runtime_identity"]["conversation_id"] == "telegram-conversation"
+        assert payload["runtime_identity"]["bound_session_id"] == "cron_eee06bdbb09b_20260506_210051"
+        assert payload["runtime_identity"]["bound_session_platform"] == "cron"
+        assert payload["runtime_identity"]["bound_conversation_id"] == "cron-conversation"
+        assert payload["lifecycle"]["conversation_id"] == "telegram-conversation"
+        assert payload["lifecycle"]["current_session_id"] == "20260506_201605_75a4c6"
+        assert payload["session_filters"]["ignored"] is False
+        assert payload["session_filters"]["stateless"] is False
+        assert payload["session_filters"]["side_channel_active"] is True
+        assert (
+            payload["session_filters"]["side_channel_session_id"]
+            == "cron_eee06bdbb09b_20260506_210051"
+        )
+
+    def test_lcm_status_reports_bound_session_when_no_foreground_yet(self, tmp_path):
+        """A fresh engine that only ever binds an ignored session must still
+        report something usable via lcm_status, with the bound session's
+        ignore flag intact so operators can see why the row count is zero.
+        """
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_first_bind_ignored.db"),
+            ignore_session_patterns=["cron:*"],
+        )
+        instance = LCMEngine(config=config)
+
+        instance.on_session_start(
+            "cron_first_run_20260506_210051",
+            platform="cron",
+            context_length=200_000,
+        )
+
+        assert instance._session_id == "cron_first_run_20260506_210051"
+        assert instance._session_ignored is True
+        assert instance._foreground_session_id == ""
+        assert instance.current_session_id == "cron_first_run_20260506_210051"
+
+        payload = json.loads(lcm_tools.lcm_status({}, engine=instance))
+        assert payload["session_id"] == "cron_first_run_20260506_210051"
+        assert payload["session_filters"]["ignored"] is True
+        assert payload["session_filters"]["side_channel_active"] is False
+        assert "side_channel_session_id" not in payload["session_filters"]
+
+    def test_stateless_session_does_not_rebind_foreground_view(self, tmp_path):
+        """The same protection applies to stateless side-channel sessions: a
+        ``debug:*``-style session must not clobber the foreground
+        ``current_session_id`` view, even though it does claim ``_session_id``
+        for its own lifecycle gating.
+        """
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_no_rebind_stateless.db"),
+            stateless_session_patterns=["debug:*"],
+        )
+        instance = LCMEngine(config=config)
+
+        instance.on_session_start(
+            "telegram-foreground",
+            platform="telegram",
+            context_length=200_000,
+        )
+
+        instance.on_session_start(
+            "debug:probe-1",
+            platform="debug",
+            context_length=200_000,
+        )
+
+        assert instance._session_id == "debug:probe-1"
+        assert instance._session_stateless is True
+        assert instance._foreground_session_id == "telegram-foreground"
+        assert instance.current_session_id == "telegram-foreground"
+        assert instance.current_session_platform == "telegram"
+
+    def test_lcm_command_status_text_is_consistent_with_lcm_status_during_cron_tick(self, tmp_path):
+        """The /lcm command's _status_text and the lcm_status tool must agree
+        on session_id, session_ignored, and session_stateless during a cron
+        tick. Without this, an operator reading /lcm status sees session_id
+        for the foreground but ignored=true for the side channel.
+        """
+        from hermes_lcm.command import _status_text
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_command_consistency.db"),
+            ignore_session_patterns=["cron:*"],
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start(
+            "telegram-foreground",
+            platform="telegram",
+            conversation_id="telegram-conversation",
+            context_length=200_000,
+        )
+        instance._store.append(
+            "telegram-foreground",
+            {"role": "user", "content": "telegram row"},
+            token_estimate=2,
+            source="telegram",
+        )
+        instance.on_session_start(
+            "cron_xxx",
+            platform="cron",
+            conversation_id="cron-conversation",
+            context_length=200_000,
+        )
+
+        text = _status_text(instance)
+        assert "session_id: telegram-foreground" in text
+        assert "conversation_id: telegram-conversation" in text
+        assert "lifecycle_current_session_id: telegram-foreground" in text
+        assert "source_messages_total: 1" in text
+        assert "store_messages: 1" in text
+        assert "session_ignored: no" in text
+        assert "session_stateless: no" in text
+        assert "side_channel_active: yes" in text
+
+    def test_lcm_doctor_retention_targets_foreground_during_cron_tick(self, tmp_path):
+        """The /lcm doctor retention surface must report on the foreground
+        session, not the cron-style side channel that briefly owns
+        engine._session_id. The SQL filter and the row aggregation both need
+        to follow current_session_id.
+        """
+        from hermes_lcm.command import _scan_retention_candidates
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_retention_during_cron.db"),
+            ignore_session_patterns=["cron:*"],
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start("telegram-foreground", platform="telegram", context_length=200_000)
+        instance._store.append(
+            "telegram-foreground",
+            {"role": "user", "content": "telegram retention test"},
+            token_estimate=3,
+            source="telegram",
+        )
+        instance.on_session_start("cron_xxx", platform="cron", context_length=200_000)
+
+        scan = _scan_retention_candidates(instance)
+        assert scan["error"] is None
+        # Foreground row surfaces; cron's empty session is not the scan
+        # target. protected is False because the bound id is cron, not the
+        # row we are reporting on.
+        assert scan["sessions_analyzed"] == 1
+        assert scan["sessions"][0]["session_id"] == "telegram-foreground"
+        assert scan["sessions"][0]["protected"] is False
+
+    def test_foreground_view_advances_when_a_real_foreground_arrives(self, tmp_path):
+        """``_foreground_session_id`` advances forward through real foreground
+        bindings (e.g., compression rollovers) but is never set to an ignored
+        or stateless session id. This is the rebind path the bug fix must not
+        regress.
+        """
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_foreground_advances.db"),
+            ignore_session_patterns=["cron:*"],
+        )
+        instance = LCMEngine(config=config)
+
+        instance.on_session_start(
+            "telegram-1",
+            platform="telegram",
+            context_length=200_000,
+        )
+        assert instance._foreground_session_id == "telegram-1"
+
+        instance.on_session_start(
+            "cron_xxx",
+            platform="cron",
+            context_length=200_000,
+        )
+        assert instance._foreground_session_id == "telegram-1"
+
+        instance.on_session_start(
+            "telegram-2",
+            platform="telegram",
+            context_length=200_000,
+        )
+        assert instance._foreground_session_id == "telegram-2"
+        assert instance.current_session_id == "telegram-2"
+
+
+class _FakeTimeoutPattern:
+    def __init__(self, pattern):
+        self.pattern = pattern
+        self._compiled = re.compile(pattern)
+
+    def search(self, text, *, timeout=None):
+        assert timeout is not None
+        return self._compiled.search(text)
+
+
+class _FakeTimeoutRegexEngine:
+    error = re.error
+
+    @staticmethod
+    def compile(pattern):
+        return _FakeTimeoutPattern(pattern)
+
 
 class TestMessageFiltering:
+    @pytest.fixture(autouse=True)
+    def _timeout_capable_regex_engine(self, monkeypatch):
+        from hermes_lcm import message_patterns as message_patterns_mod
+
+        monkeypatch.setattr(message_patterns_mod, "_regex_engine", _FakeTimeoutRegexEngine)
+
     def _make_engine(self, tmp_path, db_name, **config_kwargs):
         config = LCMConfig(
             database_path=str(tmp_path / db_name),
@@ -1058,7 +1426,7 @@ class TestMessageFiltering:
         ]
         assert engine._ignored_message_count == 0
 
-    def test_anchored_pattern_does_not_match_multimodal_content(self, tmp_path):
+    def test_anchored_pattern_matches_multimodal_text_part_content(self, tmp_path):
         engine = self._make_engine(
             tmp_path, "lcm_msg_multimodal_anchored.db",
             ignore_message_patterns=["^Cronjob Response:"],
@@ -1068,8 +1436,47 @@ class TestMessageFiltering:
             "content": [{"type": "text", "text": "Cronjob Response: heartbeat"}],
         }
         engine._ingest_messages([multimodal])
-        assert engine._store.get_session_count("user-123") == 1
-        assert engine._ignored_message_count == 0
+        assert engine._store.get_session_count("user-123") == 0
+        assert engine._ignored_message_count == 1
+
+    def test_anchored_pattern_matches_structured_text_value_parts(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_multimodal_text_value.db",
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": {"value": "Cronjob Response: nested text"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "content": "Cronjob Response: content field"}
+                ],
+            },
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("user-123") == 0
+        assert engine._ignored_message_count == 2
+
+    def test_structured_content_without_text_parts_falls_back_to_normalized_json(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_multimodal_json_fallback.db",
+            ignore_message_patterns=["file_123"],
+        )
+        multimodal = {
+            "role": "user",
+            "content": [{"type": "input_file", "file_id": "file_123"}],
+        }
+        engine._ingest_messages([multimodal])
+        assert engine._store.get_session_count("user-123") == 0
+        assert engine._ignored_message_count == 1
 
     def test_unanchored_pattern_matches_multimodal_content(self, tmp_path):
         engine = self._make_engine(
@@ -1141,6 +1548,29 @@ class TestMessageFiltering:
         ])
         assert engine._store.get_session_count("user-123") == 1
         assert engine._ignored_message_count == 1
+
+    def test_missing_regex_dependency_leaves_messages_unfiltered(self, tmp_path, monkeypatch, caplog):
+        from hermes_lcm import message_patterns as message_patterns_mod
+
+        monkeypatch.setattr(message_patterns_mod, "_regex_engine", None)
+        monkeypatch.setattr(message_patterns_mod, "_MISSING_REGEX_WARNING_EMITTED", False)
+
+        with caplog.at_level("WARNING", logger="hermes_lcm.message_patterns"):
+            engine = self._make_engine(
+                tmp_path,
+                "lcm_msg_no_regex.db",
+                ignore_message_patterns=[r"(a+)+$"],
+                ignore_message_patterns_source="env",
+            )
+
+        engine._ingest_messages([
+            {"role": "user", "content": "a" * 30 + "!"},
+        ])
+
+        assert engine._store.get_session_count("user-123") == 1
+        assert engine._ignored_message_count == 0
+        assert "regex" in caplog.text
+        assert "disabled" in caplog.text
 
     def test_status_surfaces_message_pattern_keys(self, tmp_path):
         engine = self._make_engine(
@@ -1292,6 +1722,50 @@ class TestMessageFiltering:
             "real answer",
         ]
         assert after_filter_restart._ingest_cursor == len(active_context)
+
+    def test_restart_reconciliation_matches_legacy_stored_json_with_text_first_filter(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_legacy_multimodal_reconcile.db"
+        session_id = "legacy-structured-session"
+        active_context = [
+            {"role": "user", "content": "normal before ignored tail"},
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "Cronjob Response: heartbeat"}],
+            },
+        ]
+
+        before_restart = LCMEngine(config=LCMConfig(database_path=str(db_path)))
+        before_restart.on_session_start(
+            session_id,
+            platform="telegram",
+            conversation_id="legacy-structured-conversation",
+            context_length=1000,
+        )
+        before_restart._ingest_messages(active_context)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                ignore_message_patterns=["^Cronjob Response:"],
+            )
+        )
+        after_restart.on_session_start(
+            session_id,
+            platform="telegram",
+            conversation_id="legacy-structured-conversation",
+            context_length=1000,
+        )
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(session_id)
+        assert [row["content"] for row in rows] == [
+            "normal before ignored tail",
+            '[{"text": "Cronjob Response: heartbeat", "type": "text"}]',
+        ]
+        assert after_restart._ingest_cursor == len(active_context)
 
 
 class TestEngineIngest:
@@ -5926,6 +6400,347 @@ class TestAssemblyGuardrails:
         result = instance.compress(messages)
 
         assert result == messages
+
+
+class TestAssemblyToolPairGuardrail:
+    """Regression: active context must return provider-valid tool sequences."""
+
+    def _make_engine(self, tmp_path, db_name="lcm_tool_pairs.db"):
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / db_name),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "tool-pair-test"
+        instance.compression_count = 1
+        instance.context_length = 200000
+        return instance
+
+    def _assert_provider_tool_sequence_valid(self, messages):
+        i = 0
+        while i < len(messages):
+            msg = messages[i]
+            if msg.get("role") == "tool":
+                raise AssertionError(f"bare/late tool result at index {i}: {msg!r}")
+
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                expected_ids = [
+                    str((tool_call or {}).get("id") or (tool_call or {}).get("tool_call_id") or "").strip()
+                    for tool_call in (msg.get("tool_calls") or [])
+                    if isinstance(tool_call, dict)
+                ]
+                expected_ids = [call_id for call_id in expected_ids if call_id]
+
+                for offset, expected_id in enumerate(expected_ids, start=1):
+                    assert i + offset < len(messages), (
+                        f"missing direct tool result for {expected_id} after assistant index {i}"
+                    )
+                    tool_msg = messages[i + offset]
+                    assert tool_msg.get("role") == "tool", (
+                        f"expected tool result for {expected_id} at index {i + offset}, got {tool_msg!r}"
+                    )
+                    assert str(tool_msg.get("tool_call_id") or "").strip() == expected_id
+
+                i += 1 + len(expected_ids)
+                continue
+
+            i += 1
+
+    def test_assemble_removes_orphan_tool_result(self, tmp_path):
+        """When a tool result references a call_id whose assistant tool_call
+        was removed (e.g., compacted by LCM), the assembled active context
+        must not contain that orphan tool result."""
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_orphan.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "orphan-test"
+        instance.compression_count = 1
+        instance.context_length = 200000
+
+        sys_msg = {"role": "system", "content": "You are helpful."}
+        # Simulate real-world shape: assistant summary replaced the original
+        # tool_call, leaving an orphan tool result in the fresh tail.
+        tail_messages = [
+            {"role": "assistant", "content": "[Session Arc Summary] ..."},
+            {"role": "tool", "tool_call_id": "call_orphan_x", "content": "orphan result"},
+            {"role": "assistant", "tool_calls": [{"id": "call_ok", "function": {"name": "patch", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_ok", "content": "patch result"},
+            {"role": "assistant", "content": "Done."},
+        ]
+
+        result = instance._assemble_context(sys_msg, tail_messages)
+
+        # The orphan tool result (call_orphan_x) must be removed
+        orphan_ids = [
+            m.get("tool_call_id") for m in result
+            if m.get("role") == "tool" and m.get("tool_call_id") == "call_orphan_x"
+        ]
+        assert len(orphan_ids) == 0, f"Orphan tool result still present: {orphan_ids}"
+
+    def test_assemble_inserts_stub_for_missing_tool_result(self, tmp_path):
+        """When an assistant tool_call has no matching tool result in the
+        assembled context, a stub result must be inserted."""
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_stub.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "stub-test"
+        instance.compression_count = 1
+        instance.context_length = 200000
+
+        sys_msg = {"role": "system", "content": "You are helpful."}
+        tail_messages = [
+            {"role": "assistant", "tool_calls": [{"id": "call_no_result", "function": {"name": "terminal", "arguments": "{}"}}]},
+            {"role": "assistant", "content": "Continuing..."},
+        ]
+
+        result = instance._assemble_context(sys_msg, tail_messages)
+
+        # There must be a stub tool result for call_no_result
+        stub_ids = [
+            m.get("tool_call_id") for m in result
+            if m.get("role") == "tool" and m.get("tool_call_id") == "call_no_result"
+        ]
+        assert len(stub_ids) >= 1, f"No stub result for assistant tool_call: {stub_ids}"
+
+    def test_compress_output_is_valid_tool_pair_sequence(self, tmp_path, monkeypatch):
+        """Full compress() output must not contain orphan tool results
+        and must include stubs for missing results."""
+        import importlib
+        esc_module = importlib.import_module("hermes_lcm.escalation")
+        engine_module = importlib.import_module("hermes_lcm.engine")
+
+        config = LCMConfig(
+            fresh_tail_count=4,
+            database_path=str(tmp_path / "lcm_compress_pair.db"),
+            leaf_chunk_tokens=200,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "compress-pair-test"
+        instance.context_length = 200000
+        instance.threshold_tokens = 500
+
+        def mock_summary(**kwargs):
+            return "Leaf summary.\nExpand for details about: test", 1
+
+        monkeypatch.setattr(esc_module, "summarize_with_escalation", mock_summary)
+
+        messages = [{"role": "system", "content": "You are helpful."}]
+        # Build a conversation where an assistant tool_call gets compacted
+        # but its tool result might survive into the fresh tail.
+        messages.append({"role": "user", "content": "Q0: " + "x" * 200})
+        # This assistant tool_call + result pair will be compacted:
+        messages.append({"role": "assistant", "tool_calls": [{"id": "call_compacted", "function": {"name": "terminal", "arguments": "{}"}}]})
+        messages.append({"role": "tool", "tool_call_id": "call_compacted", "content": "result that gets compacted"})
+        # More filler to push the pair into the raw backlog:
+        for i in range(1, 10):
+            messages.append({"role": "user", "content": f"Q{i}: " + "y" * 200})
+            messages.append({"role": "assistant", "content": f"A{i}: " + "z" * 200})
+
+        result = instance.compress(messages)
+
+        # After compression, no orphan tool results
+        assistant_ids = set()
+        for m in result:
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                for tc in m.get("tool_calls") or []:
+                    cid = tc.get("id") if isinstance(tc, dict) else ""
+                    if cid:
+                        assistant_ids.add(cid)
+        result_ids = set()
+        for m in result:
+            if m.get("role") == "tool" and m.get("tool_call_id"):
+                result_ids.add(m.get("tool_call_id"))
+        orphaned = result_ids - assistant_ids
+        assert len(orphaned) == 0, f"Orphan tool results after compress: {orphaned}"
+        # And no missing results (every assistant call has a result or stub)
+        missing = assistant_ids - result_ids
+        # Missing results should have stubs — verify they exist
+        for cid in missing:
+            stub_found = any(
+                m.get("role") == "tool" and m.get("tool_call_id") == cid
+                for m in result
+            )
+            assert stub_found, f"Missing stub for tool_call_id {cid}"
+
+    def test_overflow_recovery_fallback_removes_orphan_tool_result(self, tmp_path):
+        """Overflow recovery fallback must not return a bare orphan tool result."""
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_overflow_orphan.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "overflow-orphan-test"
+        instance.compression_count = 1
+        instance.context_length = 200000
+
+        sys_msg = {"role": "system", "content": "sys"}
+        tail_messages = [
+            {"role": "user", "content": "u" * 200},
+            {"role": "tool", "tool_call_id": "call_orphan", "content": "orphan tool result"},
+        ]
+
+        result = instance._assemble_overflow_recovery_context(
+            sys_msg,
+            tail_messages,
+            assembly_cap_override=1,
+        )
+
+        orphan_ids = [
+            m.get("tool_call_id") for m in result
+            if m.get("role") == "tool" and m.get("tool_call_id") == "call_orphan"
+        ]
+        assert len(orphan_ids) == 0, f"Overflow fallback leaked orphan tool result: {orphan_ids}"
+
+    def test_overflow_recovery_fallback_inserts_stub_for_missing_tool_result(self, tmp_path):
+        """Overflow recovery fallback must sanitize an assistant tool_call-only tail."""
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_overflow_stub.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "overflow-stub-test"
+        instance.compression_count = 1
+        instance.context_length = 200000
+
+        sys_msg = {"role": "system", "content": "sys"}
+        tail_messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "call_missing", "function": {"name": "terminal", "arguments": "{}"}}],
+            },
+        ]
+
+        result = instance._assemble_overflow_recovery_context(
+            sys_msg,
+            tail_messages,
+            assembly_cap_override=1,
+        )
+
+        stub_ids = [
+            m.get("tool_call_id") for m in result
+            if m.get("role") == "tool" and m.get("tool_call_id") == "call_missing"
+        ]
+        assert len(stub_ids) >= 1, f"Overflow fallback missing stub tool result: {stub_ids}"
+
+    def test_sanitize_tool_pairs_is_idempotent(self, tmp_path):
+        """Applying the helper twice must not change the result again."""
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_idempotent.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "idempotent-test"
+        instance.compression_count = 1
+        instance.context_length = 200000
+
+        messages = [
+            {"role": "system", "content": "sys"},
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "call_once", "function": {"name": "terminal", "arguments": "{}"}}],
+            },
+            {"role": "assistant", "content": "after"},
+        ]
+
+        once = instance._sanitize_tool_pairs([dict(m) for m in messages])
+        twice = instance._sanitize_tool_pairs([dict(m) for m in once])
+        assert once == twice
+
+    def test_sanitize_tool_pairs_keeps_valid_sequence_unchanged(self, tmp_path):
+        """A valid tool-call/result sequence must be preserved as-is."""
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_valid_unchanged.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "valid-unchanged-test"
+        instance.compression_count = 1
+        instance.context_length = 200000
+
+        messages = [
+            {"role": "system", "content": "sys"},
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "call_ok", "function": {"name": "terminal", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call_ok", "content": "ok"},
+            {"role": "assistant", "content": "done"},
+        ]
+
+        result = instance._sanitize_tool_pairs([dict(m) for m in messages])
+        assert result == messages
+        self._assert_provider_tool_sequence_valid(result)
+
+    def test_sanitize_tool_pairs_drops_late_tool_result_after_intervening_message(self, tmp_path):
+        instance = self._make_engine(tmp_path, "lcm_late_tool_result.db")
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "call_late", "function": {"name": "terminal", "arguments": "{}"}}]},
+            {"role": "user", "content": "intervening turn"},
+            {"role": "tool", "tool_call_id": "call_late", "content": "late result"},
+        ]
+
+        result = instance._sanitize_tool_pairs([dict(m) for m in messages])
+
+        self._assert_provider_tool_sequence_valid(result)
+        assert result[1]["role"] == "tool"
+        assert result[1]["tool_call_id"] == "call_late"
+        assert "earlier conversation" in result[1]["content"]
+        assert all(msg.get("content") != "late result" for msg in result)
+
+    def test_sanitize_tool_pairs_drops_duplicate_late_result(self, tmp_path):
+        instance = self._make_engine(tmp_path, "lcm_duplicate_tool_result.db")
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "call_dup", "function": {"name": "terminal", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_dup", "content": "direct result"},
+            {"role": "assistant", "content": "done"},
+            {"role": "tool", "tool_call_id": "call_dup", "content": "duplicate late result"},
+        ]
+
+        result = instance._sanitize_tool_pairs([dict(m) for m in messages])
+
+        self._assert_provider_tool_sequence_valid(result)
+        assert [msg.get("content") for msg in result].count("direct result") == 1
+        assert all(msg.get("content") != "duplicate late result" for msg in result)
+
+    def test_sanitize_tool_pairs_keeps_ordered_parallel_results(self, tmp_path):
+        instance = self._make_engine(tmp_path, "lcm_parallel_ordered.db")
+        messages = [
+            {"role": "assistant", "tool_calls": [
+                {"id": "call_a", "function": {"name": "read_file", "arguments": "{}"}},
+                {"id": "call_b", "function": {"name": "terminal", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_a", "content": "A"},
+            {"role": "tool", "tool_call_id": "call_b", "content": "B"},
+            {"role": "assistant", "content": "done"},
+        ]
+
+        result = instance._sanitize_tool_pairs([dict(m) for m in messages])
+
+        assert result == messages
+        self._assert_provider_tool_sequence_valid(result)
+
+    def test_sanitize_tool_pairs_replaces_out_of_order_parallel_results_with_stubs(self, tmp_path):
+        instance = self._make_engine(tmp_path, "lcm_parallel_out_of_order.db")
+        messages = [
+            {"role": "assistant", "tool_calls": [
+                {"id": "call_a", "function": {"name": "read_file", "arguments": "{}"}},
+                {"id": "call_b", "function": {"name": "terminal", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_b", "content": "B out of order"},
+            {"role": "tool", "tool_call_id": "call_a", "content": "A out of order"},
+        ]
+
+        result = instance._sanitize_tool_pairs([dict(m) for m in messages])
+
+        self._assert_provider_tool_sequence_valid(result)
+        assert [msg.get("tool_call_id") for msg in result[1:3]] == ["call_a", "call_b"]
+        assert result[1]["content"] == "A out of order"
+        assert "earlier conversation" in result[2]["content"]
+        assert all(msg.get("content") != "B out of order" for msg in result)
 
 
 class TestEngineTools:
